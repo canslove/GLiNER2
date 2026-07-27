@@ -497,10 +497,39 @@ class Structure:
     _fields: Dict[str, Any] = field(default_factory=dict)
     descriptions: Optional[Dict[str, str]] = None
 
-    def __init__(self, struct_name: str, _descriptions: Dict[str, str] = None, **fields):
+    def __init__(
+        self,
+        struct_name: str,
+        _descriptions: Dict[str, str] = None,
+        *,
+        mode: Optional[str] = None,
+        anchor: Optional[str] = None,
+        occurrence_policy: Optional[str] = None,
+        **fields,
+    ):
         self.struct_name = struct_name
         self._fields = fields
         self.descriptions = _descriptions
+        # Instance Formation metadata (optional; absence == legacy behavior).
+        self.mode = mode
+        self.anchor = anchor
+        self.occurrence_policy = occurrence_policy
+
+    def get_record_metadata(self) -> Optional[Dict[str, Any]]:
+        """Return this structure's record-metadata entry, if any mode is set."""
+        if not self.mode:
+            return None
+        entry: Dict[str, Any] = {"mode": self.mode}
+        anchor = self.anchor
+        if self.mode == "natural" and not anchor:
+            # Default anchor = first declared field, in declaration order
+            # (kwargs order, captured before any training-time field shuffling).
+            anchor = next(iter(self._fields), None)
+        if anchor is not None:
+            entry["anchor"] = anchor
+        if self.occurrence_policy is not None:
+            entry["occurrence_policy"] = self.occurrence_policy
+        return {self.struct_name: entry}
 
     def validate(self, text: str) -> List[str]:
         """
@@ -873,12 +902,18 @@ class InputExample:
         if self.structures:
             output["json_structures"] = [struct.to_dict() for struct in self.structures]
             all_descriptions = {}
+            record_metadata: Dict[str, Any] = {}
             for struct in self.structures:
                 desc = struct.get_descriptions()
                 if desc:
                     all_descriptions.update(desc)
+                meta = struct.get_record_metadata()
+                if meta:
+                    record_metadata.update(meta)
             if all_descriptions:
                 output["json_descriptions"] = all_descriptions
+            if record_metadata:
+                output["record_metadata"] = record_metadata
         if self.relations:
             output["relations"] = [rel.to_dict() for rel in self.relations]
         return {"input": self.text, "output": output}
@@ -909,6 +944,7 @@ class InputExample:
 
         structures = []
         json_descriptions = output.get("json_descriptions", {})
+        record_metadata = output.get("record_metadata", {})
         for struct_data in output.get("json_structures", []):
             for struct_name, fields in struct_data.items():
                 parsed_fields = {}
@@ -917,7 +953,15 @@ class InputExample:
                         parsed_fields[field_name] = ChoiceField(value["value"], value["choices"])
                     else:
                         parsed_fields[field_name] = value
-                structures.append(Structure(struct_name, _descriptions=json_descriptions.get(struct_name), **parsed_fields))
+                meta = record_metadata.get(struct_name, {})
+                structures.append(Structure(
+                    struct_name,
+                    _descriptions=json_descriptions.get(struct_name),
+                    mode=meta.get("mode"),
+                    anchor=meta.get("anchor"),
+                    occurrence_policy=meta.get("occurrence_policy"),
+                    **parsed_fields,
+                ))
 
         relations = []
         for rel_data in output.get("relations", []):

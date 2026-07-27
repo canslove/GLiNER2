@@ -69,22 +69,29 @@ model.quantize()
 model.compile()
 ```
 
-### 🌐 API Access: GLiNER XL 1B
+### 🧭 Multi-architecture: `AutoExtractor` & the boundary architecture
 
-Our biggest and most powerful model—**GLiNER XL 1B**—is available exclusively via API. No GPU required, no model downloads, just instant access to state-of-the-art extraction. Get your API key at [gliner.pioneer.ai](https://gliner.pioneer.ai).
+GLiNER2 supports two extraction architectures behind one API: the stable `span`
+architecture (`GLiNER2` / `SpanExtractor`) and an experimental `boundary`
+architecture (`BoundaryExtractor`) whose **sparse** start/end pairing supports
+spans of any length within the encoded window. `AutoExtractor.from_pretrained`
+picks the right class from the checkpoint's `architecture` field (missing/legacy
+configs default to `span`, so existing checkpoints load unchanged):
 
 ```python
-from gliner2 import GLiNER2
+from gliner2 import AutoExtractor
 
-# Access GLiNER XL 1B via API
-extractor = GLiNER2.from_api()  # Uses PIONEER_API_KEY env variable
-
-result = extractor.extract_entities(
-    "OpenAI CEO Sam Altman announced GPT-5 at their San Francisco headquarters.",
-    ["company", "person", "product", "location"]
-)
-# {'entities': {'company': ['OpenAI'], 'person': ['Sam Altman'], 'product': ['GPT-5'], 'location': ['San Francisco']}}
+model = AutoExtractor.from_pretrained("path/or/hub-id")  # span or boundary
+result = model.extract_entities("Apple released iPhone 15.", ["company", "product"])
 ```
+
+`GLiNER2` remains fully backward compatible (`GLiNER2 = SpanExtractor` subclass).
+The boundary architecture is **experimental** and supports entities,
+classification, and optional structured record/event decoding. Record decoding
+must be enabled when creating the boundary checkpoint. See the full guide —
+loading, creating/training a boundary model, record decoding, save/load, LoRA
+aliases, and export mode — in
+[`docs/boundary_architecture.md`](docs/boundary_architecture.md).
 
 ## 📦 Available Models
 

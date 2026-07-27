@@ -48,6 +48,7 @@ local = [
 markers = [
     "slow: end-to-end tests that load models or are otherwise slow",
     "quality: checkpoint-dependent inference quality expectations",
+    "compile: torch.compile / export-path tests (platform dependent)",
 ]
 
 [project.urls]

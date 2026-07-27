@@ -10,6 +10,7 @@ import torch
 from gliner2.inference.candidate_decoder import token_boundaries_to_character_offsets
 from gliner2.inference.runtime import ExtractorRuntimeMixin
 from gliner2.models.boundary.model import BoundaryExtractorModel
+from gliner2.models.boundary.record_decode import decode_group
 
 
 def _resolve_flat_spans(
@@ -29,9 +30,8 @@ class BoundaryExtractor(ExtractorRuntimeMixin, BoundaryExtractorModel):
 
     Overrides ``_extract_from_batch`` with the sparse candidate path: encode →
     boundary head → threshold + flat-span resolution → exact half-open
-    token→character conversion. Entities and classification are supported
-    (the PR6 experimental surface); structured/relation decoding is added in
-    later milestones.
+    token→character conversion. Entities, classification, and enabled
+    record/event schemas are supported; sparse relation decoding is deferred.
     """
 
     architecture = "boundary"
@@ -66,6 +66,14 @@ class BoundaryExtractor(ExtractorRuntimeMixin, BoundaryExtractorModel):
             end_map = batch.end_mappings[i]
             text = batch.original_texts[i]
             text_len = len(start_map)
+
+            record_results = self._decode_records(
+                batch, i, core, candidates, offset, start_map, end_map,
+                text, text_len, include_confidence, include_spans,
+            )
+            for name, instances in record_results.items():
+                if instances:
+                    sample[name] = instances
 
             entity_results: "OrderedDict[str, Any]" = OrderedDict()
             for qid, spec in enumerate(specs):
@@ -113,6 +121,85 @@ class BoundaryExtractor(ExtractorRuntimeMixin, BoundaryExtractorModel):
             results.append(sample)
 
         return results
+
+    def _decode_records(
+        self,
+        batch,
+        sample_index: int,
+        core: Dict[str, Any],
+        candidates,
+        offset: int,
+        start_map,
+        end_map,
+        text: str,
+        text_len: int,
+        include_confidence: bool,
+        include_spans: bool,
+    ) -> Dict[str, Any]:
+        """Decode record/event groups into public structure output shapes."""
+        if not getattr(self, "enable_records", False):
+            return {}
+        if candidates is None or candidates.candidate_states is None:
+            return {}
+        record_specs = getattr(batch, "record_specs", ())
+        if sample_index >= len(record_specs) or not record_specs[sample_index]:
+            return {}
+
+        settings = self.boundary_settings
+        query_states_i = core["query_states"][sample_index]
+        out: Dict[str, Any] = {}
+
+        def _format_field(spans, is_scalar):
+            formatted: List[Tuple[str, float, int, int]] = []
+            for (ts_raw, te_raw) in spans:
+                ts, te = ts_raw - offset, te_raw - offset
+                if ts < 0 or te > text_len or te <= ts:
+                    continue
+                cs, ce = token_boundaries_to_character_offsets(ts, te, start_map, end_map)
+                surface = text[cs:ce].strip()
+                if surface:
+                    formatted.append((surface, 1.0, cs, ce))
+            if is_scalar:
+                if not formatted:
+                    return None
+                s, conf, cs, ce = formatted[0]
+                if include_spans and include_confidence:
+                    return {"text": s, "confidence": conf, "start": cs, "end": ce}
+                if include_spans:
+                    return {"text": s, "start": cs, "end": ce}
+                if include_confidence:
+                    return {"text": s, "confidence": conf}
+                return s
+            return self._format_spans(
+                formatted, include_confidence, include_spans, already_finalized=True
+            )
+
+        for task_index, spec in record_specs[sample_index].items():
+            group = self.record_decoder.forward_group(
+                spec, query_states_i, candidates, sample_index
+            )
+            decoded = decode_group(
+                group,
+                anchor_threshold=settings.record_anchor_threshold,
+                field_threshold=settings.record_field_threshold,
+                object_threshold=settings.record_anchor_threshold,
+            )
+            instances = []
+            for rec in decoded:
+                inst: "OrderedDict[str, Any]" = OrderedDict()
+                # Emit every declared field in schema order (legacy shape):
+                # scalar -> str/None, list -> list[str] (possibly empty).
+                for fspec in spec.fields:
+                    spans = rec.fields.get(fspec.query_id, [])
+                    value = _format_field(spans, fspec.cardinality.is_scalar)
+                    if not fspec.cardinality.is_scalar and value is None:
+                        value = []
+                    inst[fspec.name] = value
+                if any(v is not None and v != [] for v in inst.values()):
+                    instances.append(inst)
+            if instances:
+                out[spec.task_name] = instances
+        return out
 
 
 __all__ = ["BoundaryExtractor"]

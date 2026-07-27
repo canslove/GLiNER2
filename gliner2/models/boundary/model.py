@@ -327,7 +327,10 @@ class BoundaryExtractorModel(BaseExtractorModel):
     architecture = "boundary"
 
     def task_module_names(self) -> Tuple[str, ...]:
-        return ("classifier", "boundary_head")
+        base = ("classifier", "boundary_head")
+        if getattr(self, "enable_records", False):
+            return base + ("record_decoder",)
+        return base
 
     def __init__(self, config: ExtractorConfig, encoder_config=None, tokenizer=None):
         super().__init__(config)
@@ -359,13 +362,18 @@ class BoundaryExtractorModel(BaseExtractorModel):
 
         settings = BoundaryHeadSettings(**config.boundary_head)
         self.boundary_settings = settings
-        # Record/event decoding is deferred to a later milestone; the boundary
-        # head runs in entity + classification mode only.
-        self.enable_records = False
+        self.enable_records = settings.enable_records
         self.boundary_head = BoundaryHead(
             self.hidden_size, settings, query_dim=self.hidden_size,
-            build_candidate_states=False,
+            build_candidate_states=settings.enable_records,
         )
+        if self.enable_records:
+            from gliner2.models.boundary.records import RecordHead
+            self.record_decoder = RecordHead(
+                self.hidden_size,
+                settings.record_dim,
+                settings.record_instance_queries,
+            )
 
         self._lora_layers = {}
         self._adapter_config = None
@@ -584,15 +592,70 @@ class BoundaryExtractorModel(BaseExtractorModel):
 
         cls_loss = self._classification_loss(batch, core)
 
-        needs_combine = targets is not None or bool(cls_loss.detach())
+        record_loss = None
+        if (
+            self.enable_records
+            and self.training
+            and targets is not None
+            and getattr(targets, "records", None) is not None
+            and output.candidates is not None
+            and output.candidates.candidate_states is not None
+        ):
+            record_loss = self._record_loss(batch, core, output.candidates, targets)
+
+        needs_combine = (
+            targets is not None or bool(cls_loss.detach()) or record_loss is not None
+        )
         if needs_combine:
             span_total = output.total_loss if output.total_loss is not None else torch.zeros((), device=cls_loss.device)
             combined = span_total + cls_loss
+            if record_loss is not None:
+                combined = combined + record_loss["total"]
             output.total_loss = combined
             output.loss = combined
             if output.losses is not None:
                 output.losses["classification_loss"] = cls_loss
+                if record_loss is not None:
+                    output.losses["record_object_loss"] = record_loss["object"]
+                    output.losses["record_field_loss"] = record_loss["field"]
         return output
+
+    def _record_loss(self, batch, core, candidates, targets) -> Dict[str, torch.Tensor]:
+        """Aggregate record object + field-assignment losses across the batch."""
+        from gliner2.models.boundary.record_loss import compute_group_loss
+
+        device = core["query_states"].device
+        obj_total = torch.zeros((), device=device)
+        field_total = torch.zeros((), device=device)
+        n_groups = 0
+        record_specs = getattr(batch, "record_specs", ())
+        per_sample_records = targets.records  # List[List[RecordTarget]]
+        weight = self.boundary_settings.record_loss_weight
+
+        for i in range(len(batch)):
+            if i >= len(record_specs):
+                continue
+            specs = record_specs[i]
+            if not specs:
+                continue
+            sample_records = (
+                per_sample_records[i] if i < len(per_sample_records) else []
+            )
+            query_states_i = core["query_states"][i]
+            for task_index, spec in specs.items():
+                group = self.record_decoder.forward_group(
+                    spec, query_states_i, candidates, i
+                )
+                recs = [r for r in sample_records if r.task_index == task_index]
+                losses = compute_group_loss(group, recs)
+                obj_total = obj_total + losses["object_loss"]
+                field_total = field_total + losses["field_loss"]
+                n_groups += 1
+
+        denom = max(n_groups, 1)
+        obj = obj_total / denom
+        field = field_total / denom
+        return {"object": obj, "field": field, "total": weight * (obj + field)}
 
     def score_candidates(self, batch, *, return_auxiliary_logits: bool = False) -> CandidateTensorBatch:
         was_training = self.training

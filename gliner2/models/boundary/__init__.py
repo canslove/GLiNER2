@@ -34,6 +34,21 @@ from gliner2.models.boundary.model import (
     decode_candidates,
     proposal_settings_from_head,
 )
+from gliner2.models.boundary.records import (
+    FieldAssignmentScorer,
+    InstanceCandidate,
+    InstanceCandidateBatch,
+    RecordGroupOutput,
+    RecordHead,
+    RecordSetDecoder,
+    RecordSetOutput,
+    create_anchor_instances,
+)
+from gliner2.models.boundary.record_decode import (
+    DecodedRecord,
+    decode_group,
+    derive_count,
+)
 
 __all__ = [
     "BoundaryEncoding",
@@ -58,4 +73,15 @@ __all__ = [
     "BoundaryHead",
     "decode_candidates",
     "proposal_settings_from_head",
+    "FieldAssignmentScorer",
+    "InstanceCandidate",
+    "InstanceCandidateBatch",
+    "RecordGroupOutput",
+    "RecordHead",
+    "RecordSetDecoder",
+    "RecordSetOutput",
+    "create_anchor_instances",
+    "DecodedRecord",
+    "decode_group",
+    "derive_count",
 ]
