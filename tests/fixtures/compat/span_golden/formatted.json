@@ -1,0 +1,308 @@
+[
+  {
+    "entities": {
+      "company": [
+        {
+          "text": "Apple",
+          "confidence": 0.5018592476844788,
+          "start": 15,
+          "end": 20
+        },
+        {
+          "text": "Apple",
+          "confidence": 0.5018498301506042,
+          "start": 0,
+          "end": 5
+        },
+        {
+          "text": "Records.",
+          "confidence": 0.5018110275268555,
+          "start": 21,
+          "end": 29
+        },
+        {
+          "text": "acquired",
+          "confidence": 0.5017719864845276,
+          "start": 6,
+          "end": 14
+        }
+      ],
+      "person": [
+        {
+          "text": "Apple",
+          "confidence": 0.5018429756164551,
+          "start": 15,
+          "end": 20
+        },
+        {
+          "text": "Apple",
+          "confidence": 0.5018333196640015,
+          "start": 0,
+          "end": 5
+        },
+        {
+          "text": "Records.",
+          "confidence": 0.5017951726913452,
+          "start": 21,
+          "end": 29
+        },
+        {
+          "text": "acquired",
+          "confidence": 0.5017535090446472,
+          "start": 6,
+          "end": 14
+        }
+      ],
+      "location": [
+        {
+          "text": "Apple acquired Apple",
+          "confidence": 0.5018756985664368,
+          "start": 0,
+          "end": 20
+        },
+        {
+          "text": "Records.",
+          "confidence": 0.5018274188041687,
+          "start": 21,
+          "end": 29
+        }
+      ]
+    }
+  },
+  {
+    "entities": {
+      "company": [
+        {
+          "text": "works at Google",
+          "confidence": 0.5018969774246216,
+          "start": 11,
+          "end": 26
+        },
+        {
+          "text": "in NYC",
+          "confidence": 0.5018443465232849,
+          "start": 27,
+          "end": 33
+        },
+        {
+          "text": "Smith",
+          "confidence": 0.501839816570282,
+          "start": 5,
+          "end": 10
+        },
+        {
+          "text": "John",
+          "confidence": 0.5018078088760376,
+          "start": 0,
+          "end": 4
+        },
+        {
+          "text": ".",
+          "confidence": 0.5017825961112976,
+          "start": 33,
+          "end": 34
+        }
+      ],
+      "person": [
+        {
+          "text": "works at Google",
+          "confidence": 0.5018820762634277,
+          "start": 11,
+          "end": 26
+        },
+        {
+          "text": "in NYC",
+          "confidence": 0.5018311738967896,
+          "start": 27,
+          "end": 33
+        },
+        {
+          "text": "Smith",
+          "confidence": 0.5018265247344971,
+          "start": 5,
+          "end": 10
+        },
+        {
+          "text": "John",
+          "confidence": 0.5017931461334229,
+          "start": 0,
+          "end": 4
+        },
+        {
+          "text": ".",
+          "confidence": 0.5017728805541992,
+          "start": 33,
+          "end": 34
+        }
+      ],
+      "location": [
+        {
+          "text": "works at Google",
+          "confidence": 0.5019147992134094,
+          "start": 11,
+          "end": 26
+        },
+        {
+          "text": "in NYC",
+          "confidence": 0.5018638968467712,
+          "start": 27,
+          "end": 33
+        },
+        {
+          "text": "Smith",
+          "confidence": 0.5018593668937683,
+          "start": 5,
+          "end": 10
+        },
+        {
+          "text": "John",
+          "confidence": 0.5018259882926941,
+          "start": 0,
+          "end": 4
+        },
+        {
+          "text": ".",
+          "confidence": 0.5018036365509033,
+          "start": 33,
+          "end": 34
+        }
+      ]
+    }
+  },
+  {
+    "entities": {
+      "company": [
+        {
+          "text": "dog.",
+          "confidence": 0.5018424391746521,
+          "start": 40,
+          "end": 44
+        },
+        {
+          "text": "brown fox jumps",
+          "confidence": 0.5018408298492432,
+          "start": 10,
+          "end": 25
+        },
+        {
+          "text": "lazy",
+          "confidence": 0.5018333196640015,
+          "start": 35,
+          "end": 39
+        },
+        {
+          "text": "quick",
+          "confidence": 0.5018153786659241,
+          "start": 4,
+          "end": 9
+        },
+        {
+          "text": "the",
+          "confidence": 0.501800000667572,
+          "start": 31,
+          "end": 34
+        },
+        {
+          "text": "over",
+          "confidence": 0.501786470413208,
+          "start": 26,
+          "end": 30
+        },
+        {
+          "text": "The",
+          "confidence": 0.5017697811126709,
+          "start": 0,
+          "end": 3
+        }
+      ],
+      "person": [
+        {
+          "text": "dog.",
+          "confidence": 0.5018365979194641,
+          "start": 40,
+          "end": 44
+        },
+        {
+          "text": "brown fox jumps",
+          "confidence": 0.501831591129303,
+          "start": 10,
+          "end": 25
+        },
+        {
+          "text": "lazy",
+          "confidence": 0.5018242001533508,
+          "start": 35,
+          "end": 39
+        },
+        {
+          "text": "quick",
+          "confidence": 0.5018059015274048,
+          "start": 4,
+          "end": 9
+        },
+        {
+          "text": "the",
+          "confidence": 0.5017911791801453,
+          "start": 31,
+          "end": 34
+        },
+        {
+          "text": "over",
+          "confidence": 0.501775860786438,
+          "start": 26,
+          "end": 30
+        },
+        {
+          "text": "The",
+          "confidence": 0.5017610788345337,
+          "start": 0,
+          "end": 3
+        }
+      ],
+      "location": [
+        {
+          "text": "dog.",
+          "confidence": 0.5018635988235474,
+          "start": 40,
+          "end": 44
+        },
+        {
+          "text": "brown fox jumps",
+          "confidence": 0.5018584728240967,
+          "start": 10,
+          "end": 25
+        },
+        {
+          "text": "lazy",
+          "confidence": 0.501851499080658,
+          "start": 35,
+          "end": 39
+        },
+        {
+          "text": "quick",
+          "confidence": 0.5018340945243835,
+          "start": 4,
+          "end": 9
+        },
+        {
+          "text": "the",
+          "confidence": 0.5018196105957031,
+          "start": 31,
+          "end": 34
+        },
+        {
+          "text": "over",
+          "confidence": 0.501804769039154,
+          "start": 26,
+          "end": 30
+        },
+        {
+          "text": "The",
+          "confidence": 0.5017896294593811,
+          "start": 0,
+          "end": 3
+        }
+      ]
+    }
+  }
+]

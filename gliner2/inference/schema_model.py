@@ -22,6 +22,12 @@ class FieldInput(BaseModel):
     dtype: Literal["str", "list"] = Field(default="list", description="Data type")
     choices: Optional[List[str]] = Field(default=None, description="Valid choices")
     description: Optional[str] = Field(default=None, description="Field description")
+    cardinality: Optional[
+        Literal["optional_one", "required_one", "zero_or_more", "one_or_more"]
+    ] = Field(default=None, description="Record field cardinality")
+    exclusive: bool = Field(
+        default=False, description="A mention bound here cannot bind elsewhere"
+    )
 
     @field_validator('choices')
     @classmethod
@@ -37,8 +43,31 @@ class StructureInput(BaseModel):
 
     Args:
         fields: List of field definitions
+        mode: Optional record formation mode (natural | latent | anchorless)
+        anchor: Anchor field name (required when mode == 'natural')
+        occurrence_policy: How repeated surfaces are handled during training
     """
     fields: List[FieldInput] = Field(..., min_length=1, description="List of fields")
+    mode: Optional[Literal["natural", "latent", "anchorless"]] = Field(
+        default=None, description="Record formation mode"
+    )
+    anchor: Optional[str] = Field(default=None, description="Anchor field name")
+    occurrence_policy: Optional[
+        Literal["all", "first", "error_on_ambiguous", "latent_all"]
+    ] = Field(default=None, description="Repeated-surface handling")
+
+    @model_validator(mode='after')
+    def validate_record_mode(self) -> 'StructureInput':
+        if self.mode == "natural":
+            if not self.anchor:
+                # Default anchor = first declared field (declaration order).
+                self.anchor = self.fields[0].name
+            names = {f.name for f in self.fields}
+            if self.anchor not in names:
+                raise ValueError(f"anchor {self.anchor!r} is not a declared field")
+        elif self.mode is not None and self.anchor:
+            raise ValueError(f"structure mode={self.mode!r} must not set 'anchor'")
+        return self
 
 
 class ClassificationInput(BaseModel):

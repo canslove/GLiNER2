@@ -25,8 +25,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-# Schema group task types that can carry records.
-RECORD_TASK_TYPES = ("json_structures", "relations")
+# Task types supported by the boundary record decoder. Sparse relation decoding
+# is a separate deferred surface, so relation groups must not be compiled into
+# record specs merely because a raw schema supplies record_metadata.
+RECORD_TASK_TYPES = ("json_structures",)
 
 VALID_MODES = ("natural", "latent", "anchorless")
 VALID_OCCURRENCE_POLICIES = ("all", "first", "error_on_ambiguous", "latent_all")
@@ -245,6 +247,8 @@ def compile_record_specs(
     specs: Dict[int, RecordSpec] = {}
     for task_index, queries in by_task.items():
         name = task_names[task_index]
+        if task_types[task_index] not in RECORD_TASK_TYPES:
+            continue
         cfg = normalized.get(name)
         if cfg is None:
             continue

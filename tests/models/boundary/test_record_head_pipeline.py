@@ -1,0 +1,313 @@
+"""Integrated record head: forward, marginalized loss, and global decode.
+
+These tests exercise ``RecordHead`` + ``compute_group_loss`` + ``decode_group``
+on synthetic candidate batches (no encoder), so they are fast and deterministic
+while covering the full instance-formation contract for all three modes.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Tuple
+
+import pytest
+import torch
+
+from gliner2.models.outputs import CandidateTensorBatch
+from gliner2.models.boundary.records import RecordHead
+from gliner2.models.boundary.record_loss import compute_group_loss
+from gliner2.models.boundary.record_decode import decode_group, derive_count
+from gliner2.processing.records import FieldCardinality, RecordFieldSpec, RecordSpec
+from gliner2.processing.targets import RecordFieldTarget, RecordTarget, TargetCapacityError
+
+
+def _build_tiny_records_model():
+    from gliner2 import ExtractorConfig
+    from gliner2.inference.engine import BoundaryExtractor
+    from tests.fixtures.tiny_boundary_checkpoint import TINY_BOUNDARY_HEAD
+    from tests.fixtures.tiny_encoder import build_tiny_encoder_config
+    from tests.fixtures.tiny_tokenizer import build_tiny_tokenizer
+
+    tokenizer = build_tiny_tokenizer()
+    encoder_config = build_tiny_encoder_config(vocab_size=len(tokenizer))
+    head = dict(TINY_BOUNDARY_HEAD)
+    head.update(enable_records=True, record_dim=24, record_instance_queries=8)
+    config = ExtractorConfig(
+        model_name="tiny-bert-fixture",
+        architecture="boundary",
+        boundary_head=head,
+        token_pooling="first",
+    )
+    torch.manual_seed(7)
+    model = BoundaryExtractor(config, encoder_config=encoder_config, tokenizer=tokenizer)
+    model.eval()
+    return model
+
+
+def test_records_model_exposes_head_and_candidate_states():
+    model = _build_tiny_records_model()
+    assert "record_decoder" in model.task_module_names()
+    assert hasattr(model, "record_decoder")
+
+    B, L, Q, H = 2, 12, 2, model.hidden_size
+    out = model.boundary_head(
+        torch.randn(B, L, H), torch.ones(B, L, dtype=torch.bool),
+        torch.randn(B, Q, H), torch.ones(B, Q, dtype=torch.bool),
+    )
+    cs = out.candidates.candidate_states
+    assert cs is not None
+    assert cs.shape[:2] == (B, Q) and cs.shape[-1] == H
+
+
+def test_lora_record_head_alias_resolves_to_record_decoder():
+    from gliner2.training.lora import _resolve_targets
+
+    model = _build_tiny_records_model()
+    resolved = _resolve_targets(model, ["record_head"])
+    assert resolved, "record_head alias resolved to no modules"
+    assert all(name.startswith("record_decoder.") for name in resolved)
+
+
+def test_records_training_loss_flows_through_model():
+    from gliner2.processor import SamplingConfig, SchemaTransformer
+    from gliner2.training import ExtractorCollator
+    from tests.fixtures.tiny_tokenizer import build_tiny_tokenizer
+
+    model = _build_tiny_records_model()
+    model.train()
+    proc = SchemaTransformer(
+        tokenizer=build_tiny_tokenizer(),
+        sampling_config=SamplingConfig(
+            remove_json_structure_prob=0.0, shuffle_json_fields=False,
+            remove_json_field_prob=0.0, synthetic_entity_label_prob=0.0,
+        ),
+    )
+    collator = ExtractorCollator(
+        proc, is_training=True, architecture="boundary", max_gold_per_query=16
+    )
+    output_dict = {
+        "json_structures": [
+            {"purchase": {"buyer": "Alice", "item": "apples"}},
+            {"purchase": {"buyer": "Bob", "item": "oranges"}},
+        ],
+        "record_metadata": {"purchase": {"mode": "natural", "anchor": "buyer"}},
+    }
+    batch = collator([("Alice bought apples and Bob sold oranges", output_dict)])
+    if batch.query_layouts[0].extractive_count() == 0:
+        pytest.skip("tiny tokenizer produced no extractive queries for the structure")
+
+    out = model.forward(batch)
+    assert out.total_loss is not None and torch.isfinite(out.total_loss)
+    assert "record_field_loss" in out.losses
+    out.total_loss.backward()
+    grads = [p.grad for p in model.record_decoder.parameters() if p.grad is not None]
+    assert grads, "no gradient reached the record head"
+
+
+def test_engine_decode_records_emits_public_structure_shape():
+    from types import SimpleNamespace
+
+    model = _build_tiny_records_model()
+    hidden = model.hidden_size
+    tokens = ["Alice", "bought", "apples", "then", "Bob", "left", "now"]
+    text = " ".join(tokens)
+    start_map, end_map, pos = [], [], 0
+    for tok in tokens:
+        start_map.append(pos)
+        end_map.append(pos + len(tok))
+        pos += len(tok) + 1
+
+    # anchors "Alice"(0,1) and "Bob"(4,5); one item candidate "apples"(2,3).
+    cands = make_candidates([[(0, 1), (4, 5)], [(2, 3)]], hidden, high_logit_field=0)
+    spec = RecordSpec(
+        task_index=0, task_name="purchase", task_type="json_structures", mode="natural",
+        fields=(
+            RecordFieldSpec(0, "buyer", 0, FieldCardinality.REQUIRED_ONE, is_anchor=True),
+            RecordFieldSpec(1, "item", 1, FieldCardinality.OPTIONAL_ONE),
+        ),
+        anchor_query_id=0,
+    )
+    batch = SimpleNamespace(record_specs=({0: spec},))
+    core = {"query_states": torch.randn(1, 2, hidden)}
+
+    out = model._decode_records(
+        batch, 0, core, cands, offset=0, start_map=start_map, end_map=end_map,
+        text=text, text_len=len(tokens), include_confidence=False, include_spans=False,
+    )
+    assert "purchase" in out
+    instances = out["purchase"]
+    # Both confident anchors become records; anchor field binds its own surface.
+    assert len(instances) == 2
+    buyers = {inst["buyer"] for inst in instances}
+    assert buyers == {"Alice", "Bob"}
+
+
+def make_candidates(
+    fields: List[List[Tuple[int, int]]],
+    hidden: int,
+    *,
+    high_logit_field: int = None,
+) -> CandidateTensorBatch:
+    """Build a single-sample candidate batch: ``fields[q]`` = spans for query q."""
+    q = len(fields)
+    c = max(len(f) for f in fields)
+    indices = torch.zeros(1, q, c, 2, dtype=torch.long)
+    valid = torch.zeros(1, q, c, dtype=torch.bool)
+    pair = torch.zeros(1, q, c)
+    states = torch.randn(1, q, c, hidden)
+    for qi, spans in enumerate(fields):
+        for ci, (s, e) in enumerate(spans):
+            indices[0, qi, ci, 0] = s
+            indices[0, qi, ci, 1] = e
+            valid[0, qi, ci] = True
+            if high_logit_field is not None and qi == high_logit_field:
+                pair[0, qi, ci] = 6.0
+    return CandidateTensorBatch(
+        indices=indices,
+        proposal_logits=pair.clone(),
+        pair_logits=pair,
+        valid_mask=valid,
+        query_mask=torch.ones(1, q, dtype=torch.bool),
+        candidate_states=states,
+    )
+
+
+def test_natural_mode_overfits_two_records_and_derives_count():
+    torch.manual_seed(0)
+    hidden = 24
+    # query 0 = anchor (buyer): 2 anchor spans -> 2 instances.
+    # query 1 = item (scalar): 3 candidates.
+    cands = make_candidates(
+        [[(0, 1), (3, 4)], [(1, 2), (4, 5), (6, 7)]],
+        hidden,
+        high_logit_field=0,  # anchors are confidently detected
+    )
+    spec = RecordSpec(
+        task_index=0, task_name="purchase", task_type="json_structures",
+        mode="natural",
+        fields=(
+            RecordFieldSpec(0, "buyer", 0, FieldCardinality.REQUIRED_ONE, is_anchor=True),
+            RecordFieldSpec(1, "item", 1, FieldCardinality.OPTIONAL_ONE),
+        ),
+        anchor_query_id=0,
+    )
+    query_states = torch.randn(2, hidden)
+    records = [
+        RecordTarget("0:0", 0, (
+            RecordFieldTarget(0, (((0, 1),),)),
+            RecordFieldTarget(1, (((1, 2),),)),
+        ), anchor_query_id=0),
+        RecordTarget("0:1", 0, (
+            RecordFieldTarget(0, (((3, 4),),)),
+            RecordFieldTarget(1, (((4, 5),),)),
+        ), anchor_query_id=0),
+    ]
+
+    head = RecordHead(hidden, record_dim=24, instance_queries=8)
+    opt = torch.optim.Adam(head.parameters(), lr=5e-3)
+    for _ in range(400):
+        opt.zero_grad()
+        group = head.forward_group(spec, query_states, cands, 0)
+        losses = compute_group_loss(group, records)
+        (losses["object_loss"] + losses["field_loss"]).backward()
+        opt.step()
+
+    with torch.no_grad():
+        group = head.forward_group(spec, query_states, cands, 0)
+    decoded = decode_group(group, anchor_threshold=0.5, field_threshold=0.2)
+    assert derive_count(decoded) == 2
+    by_anchor = {rec.anchor_span: rec.fields[1] for rec in decoded}
+    assert by_anchor[(0, 1)] == [(1, 2)]
+    assert by_anchor[(3, 4)] == [(4, 5)]
+
+
+def test_latent_mode_recovers_grouped_records():
+    torch.manual_seed(1)
+    hidden = 24
+    # two fields, 3 candidates each; two gold records grouping specific cands.
+    cands = make_candidates([[(0, 1), (2, 3), (4, 5)], [(1, 2), (3, 4), (5, 6)]], hidden)
+    spec = RecordSpec(
+        task_index=0, task_name="deal", task_type="json_structures", mode="latent",
+        fields=(
+            RecordFieldSpec(0, "a", 0, FieldCardinality.OPTIONAL_ONE),
+            RecordFieldSpec(1, "b", 1, FieldCardinality.OPTIONAL_ONE),
+        ),
+    )
+    query_states = torch.randn(2, hidden)
+    records = [
+        RecordTarget("0:0", 0, (
+            RecordFieldTarget(0, (((0, 1),),)),
+            RecordFieldTarget(1, (((1, 2),),)),
+        )),
+        RecordTarget("0:1", 0, (
+            RecordFieldTarget(0, (((2, 3),),)),
+            RecordFieldTarget(1, (((3, 4),),)),
+        )),
+    ]
+    head = RecordHead(hidden, record_dim=24, instance_queries=8)
+    opt = torch.optim.Adam(head.parameters(), lr=1e-2)
+    first = None
+    for step in range(500):
+        opt.zero_grad()
+        group = head.forward_group(spec, query_states, cands, 0)
+        losses = compute_group_loss(group, records)
+        total = losses["object_loss"] + losses["field_loss"]
+        if first is None:
+            first = float(total.detach())
+        last = float(total.detach())
+        total.backward()
+        opt.step()
+    assert last < first  # learning happened
+
+    with torch.no_grad():
+        group = head.forward_group(spec, query_states, cands, 0)
+    decoded = decode_group(group, anchor_threshold=0.5, field_threshold=0.3)
+    got = {
+        (tuple(rec.fields.get(0, [])), tuple(rec.fields.get(1, [])))
+        for rec in decoded
+    }
+    assert ((( 0, 1),), ((1, 2),)) in got
+    assert (((2, 3),), ((3, 4),)) in got
+
+
+def test_anchorless_capacity_error_when_gold_exceeds_queries():
+    torch.manual_seed(2)
+    hidden = 16
+    cands = make_candidates([[(0, 1), (2, 3), (4, 5)]], hidden)
+    spec = RecordSpec(
+        task_index=0, task_name="ev", task_type="json_structures", mode="anchorless",
+        fields=(RecordFieldSpec(0, "a", 0, FieldCardinality.OPTIONAL_ONE),),
+    )
+    query_states = torch.randn(1, hidden)
+    records = [
+        RecordTarget(f"0:{i}", 0, (RecordFieldTarget(0, (((2 * i, 2 * i + 1),),)),))
+        for i in range(3)
+    ]
+    head = RecordHead(hidden, record_dim=16, instance_queries=2)  # < 3 gold
+    group = head.forward_group(spec, query_states, cands, 0)
+    with pytest.raises(TargetCapacityError):
+        compute_group_loss(group, records)
+
+
+def test_decode_respects_exclusive_candidate():
+    torch.manual_seed(3)
+    hidden = 16
+    # single scalar exclusive field shared between two natural anchors; the
+    # winning (higher object) instance should claim the candidate.
+    cands = make_candidates([[(0, 1), (3, 4)], [(5, 6)]], hidden, high_logit_field=0)
+    spec = RecordSpec(
+        task_index=0, task_name="p", task_type="json_structures", mode="natural",
+        fields=(
+            RecordFieldSpec(0, "anchor", 0, FieldCardinality.REQUIRED_ONE, is_anchor=True),
+            RecordFieldSpec(1, "shared", 1, FieldCardinality.OPTIONAL_ONE, exclusive=True),
+        ),
+        anchor_query_id=0,
+    )
+    query_states = torch.randn(2, hidden)
+    head = RecordHead(hidden, record_dim=16, instance_queries=8)
+    # Force both instances to strongly prefer the single shared candidate.
+    with torch.no_grad():
+        group = head.forward_group(spec, query_states, cands, 0)
+        group.assign_logits[1][:] = torch.tensor([[-5.0, 5.0], [-5.0, 5.0]])
+    decoded = decode_group(group, anchor_threshold=0.5, field_threshold=0.2)
+    holders = [rec for rec in decoded if rec.fields.get(1)]
+    assert len(holders) == 1  # exclusivity honored across instances

@@ -79,13 +79,26 @@ class AttributeGroup:
 class StructureBuilder:
     """Builder for structured data schemas."""
 
-    def __init__(self, schema: 'Schema', parent: str):
+    def __init__(
+        self,
+        schema: 'Schema',
+        parent: str,
+        *,
+        mode: Optional[str] = None,
+        anchor: Optional[str] = None,
+        occurrence_policy: Optional[str] = None,
+    ):
         self.schema = schema
         self.parent = parent
         self.fields = OrderedDict()
         self.descriptions = OrderedDict()
         self.field_order = []
         self._finished = False
+        # Instance Formation metadata (optional; absence == legacy behavior).
+        self._mode = mode
+        self._anchor = anchor
+        self._occurrence_policy = occurrence_policy
+        self._field_records: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 
     def field(
         self,
@@ -94,14 +107,29 @@ class StructureBuilder:
         choices: Optional[List[str]] = None,
         description: Optional[str] = None,
         threshold: Optional[float] = None,
-        validators: Optional[List[RegexValidator]] = None
+        validators: Optional[List[RegexValidator]] = None,
+        cardinality: Optional[str] = None,
+        exclusive: bool = False,
     ) -> 'StructureBuilder':
-        """Add a field to the structure."""
+        """Add a field to the structure.
+
+        ``cardinality`` (``"optional_one" | "required_one" | "zero_or_more" |
+        "one_or_more"``) and ``exclusive`` refine record decoding when the
+        structure declares a record ``mode``; they are ignored otherwise.
+        """
         self.fields[name] = {"value": "", "choices": choices} if choices else ""
         self.field_order.append(name)
 
         if description:
             self.descriptions[name] = description
+
+        if cardinality is not None or exclusive:
+            entry: Dict[str, Any] = {}
+            if cardinality is not None:
+                entry["cardinality"] = cardinality
+            if exclusive:
+                entry["exclusive"] = True
+            self._field_records[name] = entry
 
         self.schema._store_field_metadata(self.parent, name, dtype, threshold, choices, validators)
         return self
@@ -115,6 +143,15 @@ class StructureBuilder:
                 if "json_descriptions" not in self.schema.schema:
                     self.schema.schema["json_descriptions"] = {}
                 self.schema.schema["json_descriptions"][self.parent] = self.descriptions
+
+            if self._mode is not None:
+                self.schema._store_record_metadata(
+                    self.parent,
+                    mode=self._mode,
+                    anchor=self._anchor,
+                    occurrence_policy=self._occurrence_policy,
+                    fields=dict(self._field_records),
+                )
 
             self._finished = True
 
@@ -140,6 +177,7 @@ class Schema:
         self._field_metadata = {}
         self._entity_metadata = {}
         self._relation_metadata = {}
+        self._record_metadata: Dict[str, Dict[str, Any]] = {}
         self._field_orders = {}
         self._entity_order = []
         self._relation_order = []
@@ -164,11 +202,59 @@ class Schema:
     def _store_field_order(self, parent, order):
         self._field_orders[parent] = order
 
-    def structure(self, name: str) -> StructureBuilder:
-        """Start building a structure schema."""
+    def _store_record_metadata(self, parent, *, mode, anchor, occurrence_policy, fields):
+        from gliner2.processing.records import VALID_MODES, VALID_OCCURRENCE_POLICIES
+        if mode not in VALID_MODES:
+            raise ValueError(f"structure mode must be one of {VALID_MODES}, got {mode!r}")
+        if mode == "natural":
+            order = self._field_orders.get(parent, [])
+            if not anchor:
+                # Default anchor = first declared field, in declaration order
+                # (captured before any training-time field shuffling).
+                if not order:
+                    raise ValueError(
+                        f"structure {parent!r} mode='natural' requires at least one field"
+                    )
+                anchor = order[0]
+            if anchor not in order:
+                raise ValueError(
+                    f"structure {parent!r} anchor {anchor!r} is not a declared field"
+                )
+        elif anchor:
+            raise ValueError(f"structure {parent!r} mode={mode!r} must not set an anchor")
+        if occurrence_policy is not None and occurrence_policy not in VALID_OCCURRENCE_POLICIES:
+            raise ValueError(
+                f"structure {parent!r} occurrence_policy must be one of "
+                f"{VALID_OCCURRENCE_POLICIES}, got {occurrence_policy!r}"
+            )
+        entry: Dict[str, Any] = {"mode": mode}
+        if anchor is not None:
+            entry["anchor"] = anchor
+        if occurrence_policy is not None:
+            entry["occurrence_policy"] = occurrence_policy
+        if fields:
+            entry["fields"] = fields
+        self._record_metadata[parent] = entry
+
+    def structure(
+        self,
+        name: str,
+        *,
+        mode: Optional[str] = None,
+        anchor: Optional[str] = None,
+        occurrence_policy: Optional[str] = None,
+    ) -> StructureBuilder:
+        """Start building a structure schema.
+
+        ``mode`` selects Instance Formation behavior: ``"natural"`` (requires
+        ``anchor``), ``"latent"``, or ``"anchorless"``. Omitting ``mode`` keeps
+        the legacy structure behavior.
+        """
         if self._active_builder:
             self._active_builder._auto_finish()
-        self._active_builder = StructureBuilder(self, name)
+        self._active_builder = StructureBuilder(
+            self, name, mode=mode, anchor=anchor, occurrence_policy=occurrence_policy
+        )
         return self._active_builder
 
     def classification(
@@ -367,6 +453,8 @@ class Schema:
         if self._active_builder:
             self._active_builder._auto_finish()
             self._active_builder = None
+        if self._record_metadata:
+            self.schema["record_metadata"] = self._record_metadata
         return self.schema
 
     @classmethod
@@ -410,13 +498,20 @@ class Schema:
 
         if validated.structures is not None:
             for struct_name, struct_input in validated.structures.items():
-                builder = schema.structure(struct_name)
+                builder = schema.structure(
+                    struct_name,
+                    mode=struct_input.mode,
+                    anchor=struct_input.anchor,
+                    occurrence_policy=struct_input.occurrence_policy,
+                )
                 for field_input in struct_input.fields:
                     builder.field(
                         name=field_input.name,
                         dtype=field_input.dtype,
                         choices=field_input.choices,
-                        description=field_input.description
+                        description=field_input.description,
+                        cardinality=field_input.cardinality,
+                        exclusive=field_input.exclusive,
                     )
                 builder._auto_finish()
 
@@ -473,6 +568,9 @@ class Schema:
             >>> schema_dict = schema.to_dict()
             >>> # schema_dict can be used with Schema.from_dict()
         """
+        if self._active_builder:
+            self._active_builder._auto_finish()
+            self._active_builder = None
         result = {}
 
         if self.schema["entities"]:
@@ -509,9 +607,24 @@ class Schema:
                         if desc:
                             field_def["description"] = desc
 
+                        rec_fields = self._record_metadata.get(struct_name, {}).get("fields", {})
+                        fmeta = rec_fields.get(field_name, {})
+                        if fmeta.get("cardinality") is not None:
+                            field_def["cardinality"] = fmeta["cardinality"]
+                        if fmeta.get("exclusive"):
+                            field_def["exclusive"] = True
+
                         fields.append(field_def)
 
-                    result["structures"][struct_name] = {"fields": fields}
+                    struct_out: Dict[str, Any] = {"fields": fields}
+                    rec_meta = self._record_metadata.get(struct_name)
+                    if rec_meta:
+                        struct_out["mode"] = rec_meta["mode"]
+                        if rec_meta.get("anchor") is not None:
+                            struct_out["anchor"] = rec_meta["anchor"]
+                        if rec_meta.get("occurrence_policy") is not None:
+                            struct_out["occurrence_policy"] = rec_meta["occurrence_policy"]
+                    result["structures"][struct_name] = struct_out
 
         if self.schema["classifications"]:
             result["classifications"] = []
