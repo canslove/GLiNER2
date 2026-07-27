@@ -187,7 +187,7 @@ def test_public_all_is_exact():
 # ---- T-R7 : exactly one Config class -----------------------------------
 
 def test_only_one_config_class_in_module():
-    root = Path(__file__).parents[1]
+    root = Path(__file__).parents[2] / "gliner2" / "classification"
     names = []
     for path in root.rglob("*.py"):
         tree = ast.parse(path.read_text())
