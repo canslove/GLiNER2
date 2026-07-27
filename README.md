@@ -87,10 +87,10 @@ result = model.extract_entities("Apple released iPhone 15.", ["company", "produc
 
 `GLiNER2` remains fully backward compatible (`GLiNER2 = SpanExtractor` subclass).
 The boundary architecture is **experimental** and supports entities,
-classification, and optional structured record/event decoding. Record decoding
-must be enabled when creating the boundary checkpoint. See the full guide —
-loading, creating/training a boundary model, record decoding, save/load, LoRA
-aliases, and export mode — in
+classification, optional structured record/event decoding, and optional sparse
+relation extraction. Records and relations must be enabled when creating the
+boundary checkpoint. See the full guide — loading, creating/training a boundary
+model, record and relation decoding, save/load, LoRA aliases, and export mode — in
 [`docs/boundary_architecture.md`](docs/boundary_architecture.md).
 
 ## 📦 Available Models

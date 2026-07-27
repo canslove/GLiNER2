@@ -49,6 +49,13 @@ from gliner2.models.boundary.record_decode import (
     decode_group,
     derive_count,
 )
+from gliner2.models.boundary.relations import (
+    RelationPairBatch,
+    RelationProposalSettings,
+    RelationTypeSpec,
+    SparseRelationScorer,
+    TypedRelationPairGenerator,
+)
 
 __all__ = [
     "BoundaryEncoding",
@@ -84,4 +91,9 @@ __all__ = [
     "DecodedRecord",
     "decode_group",
     "derive_count",
+    "RelationPairBatch",
+    "RelationProposalSettings",
+    "RelationTypeSpec",
+    "SparseRelationScorer",
+    "TypedRelationPairGenerator",
 ]
