@@ -218,6 +218,13 @@ class TrainingConfig:
     validate_data: bool = True
     max_len: Optional[int] = None
 
+    # Strict training invariants (boundary architecture; harmless for span).
+    # When strict_training is True: processor/model exceptions propagate, a
+    # non-finite loss raises, and batch-size discrepancies raise.
+    strict_training: bool = True
+    allow_invalid_samples: bool = False
+    log_proposal_metrics: bool = True
+
     # LoRA Configuration (Parameter-Efficient Fine-Tuning)
     use_lora: bool = False
     lora_r: int = 16
@@ -375,10 +382,15 @@ class ExtractorDataset(Dataset):
 class ExtractorCollator:
     """Data collator that converts raw records to model inputs."""
 
-    def __init__(self, processor: SchemaTransformer, is_training: bool = True, max_len=None):
+    def __init__(
+            self, processor: SchemaTransformer, is_training: bool = True,
+            max_len=None, architecture: str = "span", max_gold_per_query: int = 32,
+    ):
         self.processor = processor
         self.is_training = is_training
         self.max_len = max_len
+        self.architecture = architecture
+        self.max_gold_per_query = max_gold_per_query
 
     def __call__(self, batch: List[Tuple[str, Dict]]):
         """
@@ -391,9 +403,14 @@ class ExtractorCollator:
             PreprocessedBatch ready for model.forward()
         """
         if self.is_training:
-            return self.processor.collate_fn_train(batch, max_len=self.max_len)
+            return self.processor.collate_fn_train(
+                batch, max_len=self.max_len, architecture=self.architecture,
+                max_gold_per_query=self.max_gold_per_query,
+            )
         else:
-            return self.processor.collate_fn_inference(batch, max_len=self.max_len)
+            return self.processor.collate_fn_inference(
+                batch, max_len=self.max_len, architecture=self.architecture,
+            )
 
 
 # =============================================================================
@@ -462,9 +479,12 @@ def get_scheduler(optimizer, scheduler_type, num_training_steps, num_warmup_step
 # Main Trainer
 # =============================================================================
 
-class GLiNER2Trainer:
+class ExtractorTrainer:
     """
     World-class trainer for GLiNER2 with flexible multi-format data input.
+
+    Architecture-neutral: drives both the span and boundary architectures. The
+    legacy name ``GLiNER2Trainer`` is preserved as an alias.
 
     Parameters
     ----------
@@ -787,6 +807,14 @@ class GLiNER2Trainer:
                 else:
                     task_params.append(param)
 
+            # Invariant: encoder and task groups must be disjoint and complete.
+            enc_ids = {id(p) for p in encoder_params}
+            task_ids = {id(p) for p in task_params}
+            assert not (enc_ids & task_ids), "encoder/task optimizer groups overlap"
+            assert len(enc_ids | task_ids) == len(encoder_params) + len(task_params), (
+                "duplicate parameters across optimizer groups"
+            )
+
             return AdamW(
                 [
                     {"params": encoder_params, "lr": self.config.encoder_lr, "weight_decay": self.config.weight_decay},
@@ -804,7 +832,13 @@ class GLiNER2Trainer:
 
         model_config = self._get_model_config()
         max_len = self.config.max_len or getattr(model_config, "max_len", None)
-        collator = ExtractorCollator(self.processor, is_training=is_training, max_len=max_len)
+        base_model = self.model.module if self.is_distributed and hasattr(self.model, "module") else self.model
+        architecture = getattr(base_model, "architecture", "span")
+        max_gold = getattr(model_config, "boundary_head", {}).get("max_gold_per_query", 32)
+        collator = ExtractorCollator(
+            self.processor, is_training=is_training, max_len=max_len,
+            architecture=architecture, max_gold_per_query=max_gold,
+        )
 
         # Fix Bug #1 & #9: Handle small datasets
         # If dataset is smaller than batch_size, adjust to prevent empty dataloader
@@ -957,6 +991,13 @@ class GLiNER2Trainer:
                     with autocast(enabled=use_amp, dtype=amp_dtype):
                         outputs = self.model(batch)
                         loss = outputs["total_loss"]
+
+                        # Strict training: a non-finite loss is a release-blocking
+                        # failure, not something to silently step past.
+                        if self.config.strict_training and not torch.isfinite(loss).all():
+                            raise FloatingPointError(
+                                f"non-finite training loss at step {step}: {loss}"
+                            )
 
                         if self.config.gradient_accumulation_steps > 1:
                             loss = loss / self.config.gradient_accumulation_steps
@@ -1365,6 +1406,10 @@ class GLiNER2Trainer:
                 self._setup_lora()
 
         logger.info("Loaded checkpoint: %s", checkpoint_path)
+
+
+# Backward-compatible alias: the trainer is architecture-neutral now.
+GLiNER2Trainer = ExtractorTrainer
 
 
 # =============================================================================

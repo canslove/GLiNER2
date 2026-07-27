@@ -63,6 +63,12 @@ class PreprocessedBatch:
     text_word_indices: torch.Tensor = None  # (batch, max_words) gather indices
     text_word_counts: List[int] = None  # actual word count per sample
     schema_special_indices: List[List[List[int]]] = None  # per-sample, per-schema positions
+    # Architecture-neutral additions (PR 3). Default-empty so the span path is
+    # unaffected; the boundary architecture populates these.
+    query_layouts: tuple = ()  # per-sample QueryLayout
+    targets: Any = None  # PaddedTargetBatch | None
+    model_texts: tuple = ()  # tokenizer-facing (possibly mutated) text per sample
+    record_specs: tuple = ()  # per-sample {task_index: RecordSpec}
 
     def to(self, device: torch.device, dtype: torch.dtype = None) -> 'PreprocessedBatch':
         """Move tensors to device and optionally cast float tensors to dtype.
@@ -96,6 +102,10 @@ class PreprocessedBatch:
             ),
             text_word_counts=self.text_word_counts,
             schema_special_indices=self.schema_special_indices,
+            query_layouts=self.query_layouts,
+            targets=(self.targets.to(device) if self.targets is not None else None),
+            model_texts=self.model_texts,
+            record_specs=self.record_specs,
         )
 
     def pin_memory(self) -> 'PreprocessedBatch':
@@ -120,6 +130,10 @@ class PreprocessedBatch:
             ),
             text_word_counts=self.text_word_counts,
             schema_special_indices=self.schema_special_indices,
+            query_layouts=self.query_layouts,
+            targets=(self.targets.pin_memory() if self.targets is not None else None),
+            model_texts=self.model_texts,
+            record_specs=self.record_specs,
         )
 
     def __contains__(self, key: str) -> bool:
@@ -273,6 +287,10 @@ class SchemaTransformer:
             self,
             batch: List[Tuple[str, Dict]],
             max_len: Optional[int] = None,
+            *,
+            error_policy: str = "raise",
+            architecture: str = "span",
+            max_gold_per_query: int = 32,
     ) -> PreprocessedBatch:
         """
         Collate function for training DataLoader.
@@ -291,17 +309,28 @@ class SchemaTransformer:
             max_len: Maximum number of word tokens per text. Tokens beyond
                 this limit are dropped before encoding. ``None`` means no
                 truncation.
+            error_policy: How to handle a malformed record. ``"raise"``
+                (default, recommended for training) propagates the error;
+                ``"skip"`` omits the offending record; ``"fallback"`` inserts a
+                minimal dummy record (legacy compatibility behavior).
 
         Returns:
             PreprocessedBatch ready for model.forward()
         """
         self.is_training = True
-        return self._collate_batch(batch, max_len=max_len)
+        result = self._collate_batch(batch, max_len=max_len, error_policy=error_policy)
+        return self._add_boundary_metadata(
+            result, architecture, is_training=True,
+            max_gold_per_query=max_gold_per_query,
+        )
 
     def collate_fn_inference(
             self,
             batch: List[Tuple[str, Any]],
             max_len: Optional[int] = None,
+            *,
+            error_policy: str = "fallback",
+            architecture: str = "span",
     ) -> PreprocessedBatch:
         """
         Collate function for inference DataLoader.
@@ -311,12 +340,50 @@ class SchemaTransformer:
             max_len: Maximum number of word tokens per text. Tokens beyond
                 this limit are dropped before encoding. ``None`` means no
                 truncation.
+            error_policy: Malformed-record handling. Defaults to ``"fallback"``
+                to preserve the robust public inference behavior; pass
+                ``"raise"`` for strict evaluation.
 
         Returns:
             PreprocessedBatch for batch_extract
         """
         self.is_training = False
-        return self._collate_batch(batch, max_len=max_len)
+        result = self._collate_batch(batch, max_len=max_len, error_policy=error_policy)
+        return self._add_boundary_metadata(result, architecture, is_training=False)
+
+    @staticmethod
+    def _add_boundary_metadata(
+            batch: PreprocessedBatch,
+            architecture: str,
+            *,
+            is_training: bool,
+            max_gold_per_query: int = 32,
+    ) -> PreprocessedBatch:
+        if architecture != "boundary" or len(batch) == 0:
+            return batch
+        from gliner2.processing.boundary_preprocessing import build_boundary_batch_metadata
+
+        def _record_meta(schema):
+            if isinstance(schema, dict):
+                return schema.get("record_metadata")
+            return None
+
+        record_metadata_list = [_record_meta(s) for s in batch.original_schemas]
+        has_records = any(record_metadata_list)
+
+        layouts, targets, record_specs = build_boundary_batch_metadata(
+            schema_tokens_list=batch.schema_tokens_list,
+            task_types=batch.task_types,
+            structure_labels=batch.structure_labels,
+            text_lengths=batch.text_word_counts,
+            is_training=is_training,
+            max_gold_per_query=max_gold_per_query,
+            record_metadata_list=record_metadata_list if has_records else None,
+        )
+        batch.query_layouts = layouts
+        batch.targets = targets
+        batch.record_specs = record_specs
+        return batch
 
     def transform_and_format(
             self,
@@ -347,8 +414,19 @@ class SchemaTransformer:
             self,
             batch: List[Tuple[str, Any]],
             max_len: Optional[int] = None,
+            error_policy: str = "raise",
     ) -> PreprocessedBatch:
-        """Internal collate implementation."""
+        """Internal collate implementation.
+
+        ``error_policy`` controls malformed-record handling:
+          * ``"raise"``    - propagate the exception (strict; no silent zero
+            targets).
+          * ``"skip"``     - drop the record.
+          * ``"fallback"`` - insert a minimal dummy record (legacy behavior).
+        """
+        if error_policy not in ("raise", "skip", "fallback"):
+            raise ValueError(f"unknown error_policy {error_policy!r}")
+
         transformed_records = []
 
         for text, schema in batch:
@@ -369,8 +447,12 @@ class SchemaTransformer:
             try:
                 transformed = self._transform_record(record, max_len=max_len)
                 transformed_records.append(transformed)
-            except Exception as e:
-                # Create minimal fallback record
+            except Exception:
+                if error_policy == "raise":
+                    raise
+                if error_policy == "skip":
+                    continue
+                # fallback: minimal dummy record (legacy compatibility)
                 transformed_records.append(self._create_fallback_record(text, schema))
 
         return self._pad_batch(transformed_records)
@@ -640,6 +722,7 @@ class SchemaTransformer:
             return
 
         json_descs = schema.get("json_descriptions", {})
+        record_meta = schema.get("record_metadata", {}) or {}
         groups = {}
 
         for item in schema["json_structures"]:
@@ -650,6 +733,13 @@ class SchemaTransformer:
             if sampling and random.random() < sampling.remove_json_structure_prob:
                 continue
 
+            # Record-annotated structures (natural/latent/anchorless modes) must
+            # keep a stable field set: dropping the anchor field or renaming
+            # fields would break anchor->query matching and record-target
+            # identity, crashing record spec compilation. Field shuffling is
+            # still safe because records are matched by name, not position.
+            is_record = bool(record_meta.get(parent, {}).get("mode"))
+
             all_fields = set()
             for occ in occurrences:
                 all_fields.update(occ.keys())
@@ -658,9 +748,12 @@ class SchemaTransformer:
             if sampling and sampling.shuffle_json_fields:
                 random.shuffle(common)
 
-            chosen = [f for f in common if not (
-                    sampling and random.random() < sampling.remove_json_field_prob
-            )]
+            if sampling and not is_record:
+                chosen = [f for f in common if not (
+                        random.random() < sampling.remove_json_field_prob
+                )]
+            else:
+                chosen = list(common)
             if not chosen:
                 continue
 
@@ -669,7 +762,7 @@ class SchemaTransformer:
             descs = json_descs.get(parent, {})
             example_modes = ["none", "descriptions"]
 
-            if sampling and random.random() < sampling.synthetic_entity_label_prob:
+            if sampling and not is_record and random.random() < sampling.synthetic_entity_label_prob:
                 example_modes.remove("none")
                 synthetic = []
                 for i, real in enumerate(chosen, 1):

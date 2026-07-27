@@ -30,7 +30,45 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 ENCODER_PATTERNS = ["query", "key", "value", "dense"]
+# Legacy fallback for models that predate ``task_module_names()`` (span heads).
 TASK_MODULES = ["span_rep", "classifier", "count_embed", "count_pred"]
+
+
+def _task_module_names(model: nn.Module) -> tuple[str, ...]:
+    """Architecture-aware task-head module names, with a legacy fallback."""
+    method = getattr(model, "task_module_names", None)
+    if method is None:
+        return tuple(TASK_MODULES)
+    try:
+        return tuple(method())
+    except Exception:  # noqa: BLE001 - be robust to unusual models
+        return tuple(TASK_MODULES)
+
+
+def _has_module(model: nn.Module, name: str) -> bool:
+    return any(n == name or n.startswith(f"{name}.") for n, _ in model.named_modules())
+
+
+def _alias_targets(model: nn.Module, alias: str) -> tuple[str, ...]:
+    """Expand a high-level LoRA alias into concrete task-module name prefixes.
+
+    Aliases are architecture-neutral: they map through the model's own
+    ``task_module_names()`` rather than any hard-coded global head list.
+    """
+    task_modules = _task_module_names(model)
+    if alias == "all_task_heads":
+        return task_modules
+    if alias == "classification_head":
+        return ("classifier",) if _has_module(model, "classifier") else ()
+    if alias == "extractive_head":
+        if _has_module(model, "boundary_head"):
+            return ("boundary_head",)
+        return tuple(m for m in ("span_rep", "count_embed", "count_pred") if _has_module(model, m))
+    if alias == "relation_head":
+        return tuple(m for m in ("relation_scorer",) if _has_module(model, m))
+    if alias == "record_head":
+        return tuple(m for m in ("record_decoder",) if _has_module(model, m))
+    return ()
 
 
 def _resolve_targets(model: nn.Module, targets: list[str]) -> list[str]:
@@ -38,13 +76,28 @@ def _resolve_targets(model: nn.Module, targets: list[str]) -> list[str]:
 
     Args:
         model: The model to resolve targets against.
-        targets: High-level target names, e.g. ``["encoder"]``,
-            ``["encoder.query"]``, or task head names like ``["classifier"]``.
+        targets: High-level target names. Supported forms:
+            * ``"encoder"`` / ``"encoder.<pattern>"`` — encoder attention/FFN.
+            * task-module names from the model's ``task_module_names()``
+              (e.g. ``"classifier"``, ``"boundary_head"``, ``"span_rep"``).
+            * high-level aliases: ``"extractive_head"``,
+              ``"classification_head"``, ``"relation_head"``, ``"record_head"``,
+              ``"all_task_heads"`` — mapped through the model architecture.
 
     Returns:
         Sorted list of fully-qualified module paths suitable for
         passing directly to ``peft.LoraConfig(target_modules=...)``.
     """
+    task_modules = set(_task_module_names(model)) | set(TASK_MODULES)
+
+    # Expand aliases to concrete task-module prefixes.
+    head_prefixes: set[str] = set()
+    for t in targets:
+        for expanded in _alias_targets(model, t):
+            head_prefixes.add(expanded)
+        if t in task_modules:
+            head_prefixes.add(t)
+
     selected: list[str] = []
     for name, mod in model.named_modules():
         if not isinstance(mod, nn.Linear):
@@ -55,7 +108,8 @@ def _resolve_targets(model: nn.Module, targets: list[str]) -> list[str]:
                 selected.append(name)
             elif t.startswith("encoder.") and name.startswith("encoder.") and t.split(".", 1)[1] in local:
                 selected.append(name)
-            elif t in TASK_MODULES and (name == t or name.startswith(f"{t}.")):
+        for prefix in head_prefixes:
+            if name == prefix or name.startswith(f"{prefix}."):
                 selected.append(name)
     return sorted(set(selected))
 
