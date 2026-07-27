@@ -64,6 +64,13 @@ class BoundaryHeadSettings:
     record_anchor_threshold: float = 0.5    # final anchor selection threshold
     record_field_threshold: float = 0.5     # list-field / null decision cutoff
     record_loss_weight: float = 1.0
+    # Sparse typed relation scorer. Disabled by default so boundary checkpoints
+    # without this head retain their existing state-dict shape.
+    enable_relations: bool = False
+    relation_heads_per_type: int = 32
+    relation_tails_per_type: int = 32
+    relation_pair_cap: int = 128
+    relation_loss_weight: float = 1.0
 
 
 # =============================================================================
@@ -152,6 +159,19 @@ def validate_boundary_head(values: Mapping[str, Any]) -> dict:
         "record_loss_weight": float(
             values.get("record_loss_weight", d.record_loss_weight)
         ),
+        "enable_relations": bool(values.get("enable_relations", d.enable_relations)),
+        "relation_heads_per_type": int(
+            values.get("relation_heads_per_type", d.relation_heads_per_type)
+        ),
+        "relation_tails_per_type": int(
+            values.get("relation_tails_per_type", d.relation_tails_per_type)
+        ),
+        "relation_pair_cap": int(
+            values.get("relation_pair_cap", d.relation_pair_cap)
+        ),
+        "relation_loss_weight": float(
+            values.get("relation_loss_weight", d.relation_loss_weight)
+        ),
     }
     if result["export_mode"] not in ("streaming", "vectorized"):
         raise ValueError(
@@ -181,6 +201,14 @@ def validate_boundary_head(values: Mapping[str, Any]) -> dict:
             "boundary_head.record_anchor_proposal_threshold "
             f"({result['record_anchor_proposal_threshold']}) must be <= "
             f"record_anchor_threshold ({result['record_anchor_threshold']})"
+        )
+    for key in ("relation_heads_per_type", "relation_tails_per_type", "relation_pair_cap"):
+        if result[key] <= 0:
+            raise ValueError(f"boundary_head.{key} must be > 0, got {result[key]}")
+    if result["relation_loss_weight"] < 0:
+        raise ValueError(
+            "boundary_head.relation_loss_weight must be >= 0, got "
+            f"{result['relation_loss_weight']}"
         )
 
     positive_keys = [

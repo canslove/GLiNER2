@@ -10,6 +10,7 @@ import torch
 from gliner2.inference.candidate_decoder import token_boundaries_to_character_offsets
 from gliner2.inference.runtime import ExtractorRuntimeMixin
 from gliner2.models.boundary.model import BoundaryExtractorModel
+from gliner2.models.base import QueryLayout
 from gliner2.models.boundary.record_decode import decode_group
 
 
@@ -31,7 +32,7 @@ class BoundaryExtractor(ExtractorRuntimeMixin, BoundaryExtractorModel):
     Overrides ``_extract_from_batch`` with the sparse candidate path: encode →
     boundary head → threshold + flat-span resolution → exact half-open
     token→character conversion. Entities, classification, and enabled
-    record/event schemas are supported; sparse relation decoding is deferred.
+    record/event schemas and enabled sparse relation decoding are supported.
     """
 
     architecture = "boundary"
@@ -74,6 +75,12 @@ class BoundaryExtractor(ExtractorRuntimeMixin, BoundaryExtractorModel):
             for name, instances in record_results.items():
                 if instances:
                     sample[name] = instances
+
+            relation_results = self._decode_relations(
+                i, core, candidates, metadata_list[i], threshold, offset,
+                start_map, end_map, text, text_len, include_confidence, include_spans,
+            )
+            sample.update(relation_results)
 
             entity_results: "OrderedDict[str, Any]" = OrderedDict()
             for qid, spec in enumerate(specs):
@@ -121,6 +128,86 @@ class BoundaryExtractor(ExtractorRuntimeMixin, BoundaryExtractorModel):
             results.append(sample)
 
         return results
+
+    def _decode_relations(
+        self,
+        sample_index: int,
+        core: Dict[str, Any],
+        candidates,
+        metadata: Dict[str, Any],
+        threshold: float,
+        offset: int,
+        start_map,
+        end_map,
+        text: str,
+        text_len: int,
+        include_confidence: bool,
+        include_spans: bool,
+    ) -> Dict[str, Any]:
+        """Decode sparse relation pairs for one sample."""
+        if not getattr(self, "enable_relations", False) or candidates is None:
+            return {}
+        rel_specs = core["rel_specs"][sample_index]
+        if not rel_specs:
+            return {}
+        sample_candidates = self._single_sample_candidates(candidates, sample_index)
+        pairs = self.relation_pair_generator.generate(
+            sample_candidates,
+            [QueryLayout(queries=())],
+            [entry["spec"] for entry in rel_specs],
+        )
+        if not len(pairs):
+            return {}
+        query_states = torch.stack(
+            [entry["query_state"] for entry in rel_specs]
+        ).unsqueeze(0)
+        logits = self.relation_scorer(
+            core["text_states"][sample_index:sample_index + 1],
+            query_states,
+            sample_candidates,
+            pairs,
+        )
+        probabilities = torch.sigmoid(logits)
+        out: Dict[str, Any] = {}
+        relation_metadata = metadata.get("relation_metadata", {})
+        for pair_index, probability in enumerate(probabilities):
+            relation_type = pairs.relation_types[pair_index]
+            relation_threshold = relation_metadata.get(relation_type, {}).get(
+                "threshold", threshold
+            )
+            if relation_threshold is None:
+                relation_threshold = threshold
+            score = float(probability.detach())
+            if score < relation_threshold:
+                continue
+            hs = int(pairs.head_start[pair_index]) - offset
+            he = int(pairs.head_end[pair_index]) - offset
+            ts = int(pairs.tail_start[pair_index]) - offset
+            te = int(pairs.tail_end[pair_index]) - offset
+            if not (0 <= hs < he <= text_len and 0 <= ts < te <= text_len):
+                continue
+            h0, h1 = token_boundaries_to_character_offsets(hs, he, start_map, end_map)
+            t0, t1 = token_boundaries_to_character_offsets(ts, te, start_map, end_map)
+            head, tail = text[h0:h1].strip(), text[t0:t1].strip()
+            if not head or not tail:
+                continue
+            if include_spans:
+                value = {
+                    "head": {"text": head, "start": h0, "end": h1},
+                    "tail": {"text": tail, "start": t0, "end": t1},
+                }
+                if include_confidence:
+                    value["head"]["confidence"] = score
+                    value["tail"]["confidence"] = score
+            elif include_confidence:
+                value = {
+                    "head": {"text": head, "confidence": score},
+                    "tail": {"text": tail, "confidence": score},
+                }
+            else:
+                value = (head, tail)
+            out.setdefault(relation_type, []).append(value)
+        return out
 
     def _decode_records(
         self,

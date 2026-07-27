@@ -40,6 +40,12 @@ from gliner2.models.boundary.proposal import (
     SparseBoundaryProposer,
 )
 from gliner2.models.boundary.scoring import SparseBoundaryPairScorer, gather_boundary_states
+from gliner2.models.boundary.relations import (
+    RelationProposalSettings,
+    RelationTypeSpec,
+    SparseRelationScorer,
+    TypedRelationPairGenerator,
+)
 from gliner2.models.base import QueryLayout, QuerySpec
 from gliner2.models.outputs import CandidateTensorBatch, ExtractorOutput
 from gliner2.processing.targets import (
@@ -328,9 +334,12 @@ class BoundaryExtractorModel(BaseExtractorModel):
 
     def task_module_names(self) -> Tuple[str, ...]:
         base = ("classifier", "boundary_head")
+        extras = ()
         if getattr(self, "enable_records", False):
-            return base + ("record_decoder",)
-        return base
+            extras += ("record_decoder",)
+        if getattr(self, "enable_relations", False):
+            extras += ("relation_scorer",)
+        return base + extras
 
     def __init__(self, config: ExtractorConfig, encoder_config=None, tokenizer=None):
         super().__init__(config)
@@ -363,6 +372,7 @@ class BoundaryExtractorModel(BaseExtractorModel):
         settings = BoundaryHeadSettings(**config.boundary_head)
         self.boundary_settings = settings
         self.enable_records = settings.enable_records
+        self.enable_relations = settings.enable_relations
         self.boundary_head = BoundaryHead(
             self.hidden_size, settings, query_dim=self.hidden_size,
             build_candidate_states=settings.enable_records,
@@ -373,6 +383,17 @@ class BoundaryExtractorModel(BaseExtractorModel):
                 self.hidden_size,
                 settings.record_dim,
                 settings.record_instance_queries,
+            )
+        if self.enable_relations:
+            self.relation_pair_generator = TypedRelationPairGenerator(
+                RelationProposalSettings(
+                    heads_per_relation=settings.relation_heads_per_type,
+                    tails_per_relation=settings.relation_tails_per_type,
+                    pair_cap=settings.relation_pair_cap,
+                )
+            )
+            self.relation_scorer = SparseRelationScorer(
+                self.hidden_size, dropout=settings.dropout
             )
 
         self._lora_layers = {}
@@ -415,12 +436,14 @@ class BoundaryExtractorModel(BaseExtractorModel):
         ext_specs: List[List[Dict[str, Any]]] = []
         ext_embs: List[List[torch.Tensor]] = []
         cls_specs: List[List[Dict[str, Any]]] = []
+        rel_specs: List[List[Dict[str, Any]]] = []
         word_offsets: List[int] = []
 
         for i in range(n):
             specs_i: List[Dict[str, Any]] = []
             embs_i: List[torch.Tensor] = []
             cls_i: List[Dict[str, Any]] = []
+            rel_i: List[Dict[str, Any]] = []
             text_len_i = len(batch.start_mappings[i]) if batch.start_mappings else text_lengths[i]
             word_offsets.append(max(text_lengths[i] - text_len_i, 0))
 
@@ -441,6 +464,7 @@ class BoundaryExtractorModel(BaseExtractorModel):
                             "group_embs": torch.stack(group_embs),
                         })
                     continue
+                first_query_id = len(specs_i)
                 for fidx, fname in enumerate(field_names):
                     if 1 + fidx >= len(group_embs):
                         break
@@ -452,10 +476,29 @@ class BoundaryExtractorModel(BaseExtractorModel):
                         "field_name": fname,
                     })
                     embs_i.append(group_embs[1 + fidx])
+                if task_type == "relations" and len(specs_i) > first_query_id:
+                    query_ids = {
+                        field_names[idx]: first_query_id + idx
+                        for idx in range(min(len(field_names), len(specs_i) - first_query_id))
+                    }
+                    head_id = query_ids.get("head")
+                    tail_id = query_ids.get("tail")
+                    if head_id is not None and tail_id is not None:
+                        rel_i.append({
+                            "group_index": g,
+                            "relation_type": name,
+                            "spec": RelationTypeSpec(
+                                name, head_query_ids=(head_id,), tail_query_ids=(tail_id,)
+                            ),
+                            "query_state": torch.stack(
+                                group_embs[1:1 + len(field_names)]
+                            ).mean(dim=0),
+                        })
 
             ext_specs.append(specs_i)
             ext_embs.append(embs_i)
             cls_specs.append(cls_i)
+            rel_specs.append(rel_i)
 
         max_q = max((len(e) for e in ext_embs), default=0)
         query_states = torch.zeros(n, max_q, h, device=device, dtype=token_embeddings.dtype)
@@ -473,6 +516,7 @@ class BoundaryExtractorModel(BaseExtractorModel):
             "query_mask": query_mask,
             "ext_specs": ext_specs,
             "cls_specs": cls_specs,
+            "rel_specs": rel_specs,
             "word_offsets": word_offsets,
         }
 
@@ -556,6 +600,102 @@ class BoundaryExtractorModel(BaseExtractorModel):
                 )
         return total
 
+    @staticmethod
+    def _single_sample_candidates(
+        candidates: CandidateTensorBatch, sample_index: int
+    ) -> CandidateTensorBatch:
+        """Keep one sample while preserving the padded candidate contract."""
+        return CandidateTensorBatch(
+            indices=candidates.indices[sample_index:sample_index + 1],
+            proposal_logits=candidates.proposal_logits[sample_index:sample_index + 1],
+            pair_logits=candidates.pair_logits[sample_index:sample_index + 1],
+            valid_mask=candidates.valid_mask[sample_index:sample_index + 1],
+            query_mask=candidates.query_mask[sample_index:sample_index + 1],
+            candidate_states=(
+                candidates.candidate_states[sample_index:sample_index + 1]
+                if candidates.candidate_states is not None else None
+            ),
+        )
+
+    def _relation_loss(self, batch, core, candidates) -> Optional[torch.Tensor]:
+        """Binary relation-pair loss over sparse, gold-inclusive proposals."""
+        if candidates is None:
+            return None
+        structure_labels = getattr(batch, "structure_labels", None)
+        if not structure_labels:
+            return None
+
+        total = torch.zeros((), device=core["text_states"].device)
+        groups = 0
+        empty_layout = QueryLayout(queries=())
+        for sample_index, rel_specs in enumerate(core["rel_specs"]):
+            if not rel_specs:
+                continue
+            sample_candidates = self._single_sample_candidates(candidates, sample_index)
+            relation_schema = [entry["spec"] for entry in rel_specs]
+            pairs = self.relation_pair_generator.generate(
+                sample_candidates, [empty_layout], relation_schema
+            )
+            if len(pairs) == 0:
+                continue
+            query_states = torch.stack(
+                [entry["query_state"] for entry in rel_specs]
+            ).unsqueeze(0)
+            logits = self.relation_scorer(
+                core["text_states"][sample_index:sample_index + 1],
+                query_states,
+                sample_candidates,
+                pairs,
+            )
+            gold = set()
+            for relation_index, entry in enumerate(rel_specs):
+                labels = structure_labels[sample_index][entry["group_index"]]
+                if not labels or labels[0] == 0:
+                    continue
+                specs = core["ext_specs"][sample_index]
+                head_spec = specs[entry["spec"].head_query_ids[0]]
+                tail_spec = specs[entry["spec"].tail_query_ids[0]]
+                for instance in labels[1]:
+                    if (
+                        head_spec["field_index"] >= len(instance)
+                        or tail_spec["field_index"] >= len(instance)
+                    ):
+                        continue
+                    for hs, he in _iter_inclusive_spans(
+                        instance[head_spec["field_index"]]
+                    ):
+                        for ts, te in _iter_inclusive_spans(
+                            instance[tail_spec["field_index"]]
+                        ):
+                            gold.add((relation_index, hs, he + 1, ts, te + 1))
+            labels = torch.tensor(
+                [
+                    float(
+                        (
+                            int(relation_index),
+                            int(hs),
+                            int(he),
+                            int(ts),
+                            int(te),
+                        ) in gold
+                    )
+                    for relation_index, hs, he, ts, te in zip(
+                        pairs.relation_index,
+                        pairs.head_start,
+                        pairs.head_end,
+                        pairs.tail_start,
+                        pairs.tail_end,
+                    )
+                ],
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            total = total + F.binary_cross_entropy_with_logits(logits, labels)
+            groups += 1
+        if groups == 0:
+            return None
+        return self.boundary_settings.relation_loss_weight * total / groups
+
     # =========================================================================
     # Forward
     # =========================================================================
@@ -602,15 +742,23 @@ class BoundaryExtractorModel(BaseExtractorModel):
             and output.candidates.candidate_states is not None
         ):
             record_loss = self._record_loss(batch, core, output.candidates, targets)
+        relation_loss = None
+        if self.enable_relations and self.training and output.candidates is not None:
+            relation_loss = self._relation_loss(batch, core, output.candidates)
 
         needs_combine = (
-            targets is not None or bool(cls_loss.detach()) or record_loss is not None
+            targets is not None
+            or bool(cls_loss.detach())
+            or record_loss is not None
+            or relation_loss is not None
         )
         if needs_combine:
             span_total = output.total_loss if output.total_loss is not None else torch.zeros((), device=cls_loss.device)
             combined = span_total + cls_loss
             if record_loss is not None:
                 combined = combined + record_loss["total"]
+            if relation_loss is not None:
+                combined = combined + relation_loss
             output.total_loss = combined
             output.loss = combined
             if output.losses is not None:
@@ -618,6 +766,8 @@ class BoundaryExtractorModel(BaseExtractorModel):
                 if record_loss is not None:
                     output.losses["record_object_loss"] = record_loss["object"]
                     output.losses["record_field_loss"] = record_loss["field"]
+                if relation_loss is not None:
+                    output.losses["relation_loss"] = relation_loss
         return output
 
     def _record_loss(self, batch, core, candidates, targets) -> Dict[str, torch.Tensor]:
