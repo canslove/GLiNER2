@@ -255,7 +255,7 @@ def test_count_top_k_is_call_scoped():
 def test_only_joint_ie_config_class_exists():
     import ast
     from pathlib import Path
-    root = Path(__file__).parents[1]
+    root = Path(__file__).parents[2] / "gliner2" / "joint_ie"
     names = []
     for path in root.rglob("*.py"):
         tree = ast.parse(path.read_text())
