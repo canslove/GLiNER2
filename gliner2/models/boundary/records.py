@@ -17,8 +17,8 @@ The low-level primitives ``FieldAssignmentScorer`` and ``RecordSetDecoder`` are
 retained (and unit-tested) as building blocks; ``RecordHead`` is the integrated,
 schema-aware module used by :class:`BoundaryExtractorModel` and the engine.
 
-Record *count* is never predicted; it is derived from the selected instances by
-the global decoder in :mod:`gliner2.models.boundary.record_decode`.
+Record *count* is never predicted; it is derived from selected instances by the
+global decoder implemented below.
 """
 
 from __future__ import annotations
@@ -29,9 +29,16 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from gliner2.models.candidates import CandidateSet
+from gliner2.models.boundary.constants import MASK_LOGIT
 from gliner2.processing.records import FieldCardinality, RecordFieldSpec, RecordSpec
+from gliner2.processing.targets import RecordTarget, TargetCapacityError
+from gliner2.training.matching import (
+    build_dense_record_matching_cost,
+    linear_sum_assignment,
+)
 
 
 # =============================================================================
@@ -197,6 +204,41 @@ class RecordGroupOutput:
         return int(self.object_logits.shape[0])
 
 
+@dataclass
+class DenseRecordGroupOutput:
+    """Shared-pool training representation with no ragged candidate axis."""
+
+    spec: RecordSpec
+    object_logits: torch.Tensor              # [I]
+    assign_logits: torch.Tensor              # [I,F,1+C_doc]
+    instance_mask: torch.BoolTensor           # [I]
+    field_membership: torch.BoolTensor        # [F,C_doc]
+    pool_spans: torch.LongTensor              # [C_doc,2]
+    field_specs: Tuple[RecordFieldSpec, ...]
+    field_query_ids: torch.LongTensor         # [F]
+    instance_pool_index: torch.LongTensor     # [I], -1 for learned queries
+
+    @property
+    def num_instances(self) -> int:
+        return self.object_logits.shape[0]
+
+
+@dataclass
+class DenseRecordBatchOutput:
+    """Fully batched shared-pool record representation."""
+
+    object_logits: torch.Tensor          # [B,R,I]
+    assign_logits: torch.Tensor          # [B,R,I,F,1+C]
+    instance_mask: torch.BoolTensor      # [B,R,I]
+    field_membership: torch.BoolTensor   # [B,R,F,C]
+    pool_spans: torch.LongTensor         # [B,C,2]
+    field_mask: torch.BoolTensor         # [B,R,F]
+    scalar_fields: torch.BoolTensor      # [B,R,F]
+    modes: torch.LongTensor              # [B,R]
+    anchor_fields: torch.LongTensor      # [B,R]
+    group_mask: torch.BoolTensor         # [B,R]
+
+
 class RecordHead(nn.Module):
     """Unified natural / latent / anchorless instance formation head.
 
@@ -262,6 +304,247 @@ class RecordHead(nn.Module):
         return inst + pooled
 
     # ---------------------------------------------------------------- forward
+    def forward_groups_dense(
+        self,
+        query_states: torch.Tensor,
+        candidates,
+        routing: tuple[torch.Tensor, ...],
+    ) -> DenseRecordBatchOutput:
+        """Score every sample/record-group without Python tensor loops."""
+        (
+            field_query_ids,
+            field_mask,
+            scalar_fields,
+            modes,
+            anchor_fields,
+            group_mask,
+        ) = routing
+        device = query_states.device
+        field_query_ids = field_query_ids.to(device)
+        field_mask = field_mask.to(device)
+        scalar_fields = scalar_fields.to(device)
+        modes = modes.to(device)
+        anchor_fields = anchor_fields.to(device)
+        group_mask = group_mask.to(device)
+        b, groups, fields = field_query_ids.shape
+        candidate_count = candidates.indices.shape[2]
+        instance_count = max(candidate_count, self.instance_queries)
+        hidden = query_states.shape[-1]
+        batch_index = torch.arange(b, device=device)[:, None, None]
+        safe_query_ids = field_query_ids.clamp(
+            min=0, max=max(query_states.shape[1] - 1, 0)
+        )
+        field_queries = query_states[batch_index, safe_query_ids]
+        pool_states = candidates.candidate_states[:, 0]
+        pool_spans = candidates.indices[:, 0]
+        pool_mask = candidates.valid_mask[:, 0]
+        membership = (
+            candidates.valid_mask[batch_index, safe_query_ids]
+            & candidates.query_mask[batch_index, safe_query_ids].unsqueeze(-1)
+            & field_mask.unsqueeze(-1)
+            & pool_mask[:, None, None, :]
+        )
+
+        padded_pool_states = F.pad(
+            pool_states, (0, 0, 0, instance_count - candidate_count)
+        )
+        pool_instances = padded_pool_states[:, None].expand(
+            b, groups, instance_count, hidden
+        )
+        learned = F.pad(
+            self.instance_embed,
+            (0, 0, 0, instance_count - self.instance_queries),
+        )
+        learned = learned[None, None].expand(b, groups, -1, -1)
+        q = self.q_proj(learned)
+        k = self.k_proj(pool_states)[:, None].expand(b, groups, -1, -1)
+        v = self.v_proj(pool_states)[:, None].expand(b, groups, -1, -1)
+        attention = torch.einsum("brid,brcd->bric", q, k)
+        attention = attention / math.sqrt(self.record_dim)
+        attention = attention.masked_fill(
+            ~pool_mask[:, None, None, :], MASK_LOGIT
+        )
+        anchorless_instances = learned + torch.einsum(
+            "bric,brch->brih", torch.softmax(attention, -1), v
+        )
+        is_anchorless = modes == 2
+        instance_states = torch.where(
+            is_anchorless[..., None, None],
+            anchorless_instances,
+            pool_instances,
+        )
+
+        anchor_index = anchor_fields.clamp(min=0)
+        anchor_membership = membership.gather(
+            2,
+            anchor_index[..., None, None].expand(
+                b, groups, 1, candidate_count
+            ),
+        ).squeeze(2)
+        pool_instance_mask = F.pad(
+            pool_mask[:, None, :].expand(b, groups, -1),
+            (0, instance_count - candidate_count),
+        )
+        natural_mask = F.pad(
+            anchor_membership, (0, instance_count - candidate_count)
+        )
+        latent_mask = F.pad(
+            membership.any(2), (0, instance_count - candidate_count)
+        )
+        learned_mask = (
+            torch.arange(instance_count, device=device)
+            < self.instance_queries
+        )[None, None].expand(b, groups, -1)
+        instance_mask = torch.where(
+            (modes == 0)[..., None],
+            natural_mask,
+            torch.where((modes == 1)[..., None], latent_mask, learned_mask),
+        )
+        instance_mask &= group_mask[..., None]
+
+        anchor_qid = field_query_ids.gather(
+            2, anchor_index.unsqueeze(-1)
+        ).squeeze(-1).clamp(min=0)
+        natural_object = candidates.pair_logits[
+            torch.arange(b, device=device)[:, None],
+            anchor_qid,
+        ]
+        natural_object = F.pad(
+            natural_object, (0, instance_count - candidate_count)
+        )
+        latent_object = F.pad(
+            self.latent_seed_head(pool_states).squeeze(-1),
+            (0, instance_count - candidate_count),
+        )[:, None].expand(b, groups, -1)
+        anchorless_object = self.object_head(anchorless_instances).squeeze(-1)
+        object_logits = torch.where(
+            (modes == 0)[..., None],
+            natural_object,
+            torch.where(
+                (modes == 1)[..., None],
+                latent_object,
+                anchorless_object,
+            ),
+        )
+        object_logits = object_logits.masked_fill(~instance_mask, MASK_LOGIT)
+
+        instance_query = self.inst_proj(instance_states)
+        field_query = self.field_proj(field_queries)
+        assignment_query = (
+            instance_query.unsqueeze(3) + field_query.unsqueeze(2)
+        )
+        null_logits = torch.einsum(
+            "brifd,d->brif", assignment_query, self.null_embed
+        )
+        candidate_logits = torch.einsum(
+            "brifd,bcd->brifc",
+            assignment_query,
+            self.cand_proj(pool_states),
+        )
+        candidate_logits = candidate_logits.masked_fill(
+            ~membership.unsqueeze(2), MASK_LOGIT
+        )
+        assign_logits = torch.cat(
+            (null_logits.unsqueeze(-1), candidate_logits), -1
+        )
+        return DenseRecordBatchOutput(
+            object_logits,
+            assign_logits,
+            instance_mask,
+            membership,
+            pool_spans,
+            field_mask,
+            scalar_fields,
+            modes,
+            anchor_fields,
+            group_mask,
+        )
+
+    def forward_group_dense(
+        self,
+        spec: RecordSpec,
+        query_states: torch.Tensor,
+        candidates,
+        sample_index: int,
+    ) -> DenseRecordGroupOutput:
+        """Tensorized shared-document-pool forward used during training."""
+        field_specs = tuple(spec.fields)
+        field_query_ids = torch.as_tensor(
+            [field.query_id for field in field_specs],
+            dtype=torch.long,
+            device=query_states.device,
+        )
+        pool_states = candidates.candidate_states[sample_index, 0]  # [C,H]
+        pool_spans = candidates.indices[sample_index, 0].to(torch.long)
+        pool_mask = candidates.valid_mask[sample_index, 0]
+        membership = (
+            candidates.valid_mask[sample_index, field_query_ids]
+            & candidates.query_mask[sample_index, field_query_ids].unsqueeze(-1)
+            & pool_mask.unsqueeze(0)
+        )
+        field_queries = query_states[field_query_ids]
+
+        if spec.mode == "natural":
+            anchor_matches = field_query_ids == spec.anchor_query_id
+            anchor_index = anchor_matches.to(torch.long).argmax()
+            instance_states = pool_states
+            instance_mask = membership[anchor_index]
+            object_logits = candidates.pair_logits[
+                sample_index, field_query_ids[anchor_index]
+            ]
+            instance_pool_index = torch.arange(
+                pool_states.shape[0], device=pool_states.device
+            )
+        elif spec.mode == "latent":
+            instance_states = pool_states
+            instance_mask = membership.any(0)
+            object_logits = self.latent_seed_head(pool_states).squeeze(-1)
+            instance_pool_index = torch.arange(
+                pool_states.shape[0], device=pool_states.device
+            )
+        else:
+            instance_states = self.instance_embed
+            q = self.q_proj(instance_states)
+            k = self.k_proj(pool_states)
+            v = self.v_proj(pool_states)
+            attention = torch.einsum("id,cd->ic", q, k) / math.sqrt(self.record_dim)
+            attention = attention.masked_fill(~pool_mask.unsqueeze(0), MASK_LOGIT)
+            pooled = torch.einsum("ic,ch->ih", torch.softmax(attention, -1), v)
+            instance_states = instance_states + pooled
+            instance_mask = torch.ones(
+                self.instance_queries, dtype=torch.bool, device=pool_states.device
+            )
+            object_logits = self.object_head(instance_states).squeeze(-1)
+            instance_pool_index = torch.full(
+                (self.instance_queries,), -1, dtype=torch.long,
+                device=pool_states.device,
+            )
+
+        instance_query = self.inst_proj(instance_states)
+        field_query = self.field_proj(field_queries)
+        query = instance_query[:, None, :] + field_query[None, :, :]
+        null_logits = torch.einsum("ifd,d->if", query, self.null_embed)
+        candidate_logits = torch.einsum(
+            "ifd,cd->ifc", query, self.cand_proj(pool_states)
+        )
+        candidate_logits = candidate_logits.masked_fill(
+            ~membership.unsqueeze(0), MASK_LOGIT
+        )
+        assign_logits = torch.cat(
+            (null_logits.unsqueeze(-1), candidate_logits), dim=-1
+        )
+        return DenseRecordGroupOutput(
+            spec=spec,
+            object_logits=object_logits,
+            assign_logits=assign_logits,
+            instance_mask=instance_mask,
+            field_membership=membership,
+            pool_spans=pool_spans,
+            field_specs=field_specs,
+            field_query_ids=field_query_ids,
+            instance_pool_index=instance_pool_index,
+        )
+
     def forward_group(
         self,
         spec: RecordSpec,
@@ -358,5 +641,594 @@ __all__ = [
     "RecordSetOutput",
     "RecordSetDecoder",
     "RecordGroupOutput",
+    "DenseRecordGroupOutput",
     "RecordHead",
+    "DecodedRecord",
+    "decode_group",
+    "derive_count",
+    "compute_group_loss",
+    "compute_dense_group_loss",
+    "build_dense_record_cost",
 ]
+
+
+# =============================================================================
+# Global record decoding
+# =============================================================================
+
+@dataclass
+class DecodedRecord:
+    """One decoded record: field query id -> selected half-open token spans."""
+
+    fields: Dict[int, List[Tuple[int, int]]] = field(default_factory=dict)
+    anchor_span: Optional[Tuple[int, int]] = None
+    score: float = 0.0
+
+
+def _dedup_key(rec: DecodedRecord) -> Tuple:
+    return tuple(
+        (qid, tuple(sorted(spans)))
+        for qid, spans in sorted(rec.fields.items())
+    )
+
+
+def decode_group(
+    group: RecordGroupOutput,
+    *,
+    anchor_threshold: float = 0.5,
+    field_threshold: float = 0.5,
+    object_threshold: float = 0.5,
+    temperature: float = 1.0,
+) -> List[DecodedRecord]:
+    """Decode one record group into a list of :class:`DecodedRecord`."""
+    ni = group.num_instances
+    if ni == 0:
+        return []
+    if temperature <= 0:
+        raise ValueError("temperature must be > 0")
+    obj_prob = torch.sigmoid(group.object_logits.detach() / temperature)
+    select_thr = object_threshold if group.spec.mode == "anchorless" else anchor_threshold
+    order = sorted(range(ni), key=lambda i: (-float(obj_prob[i]), i))
+
+    used_exclusive: set = set()
+    records: List[DecodedRecord] = []
+    for inst in order:
+        if float(obj_prob[inst]) < select_thr:
+            continue
+        rec = DecodedRecord(score=float(obj_prob[inst]))
+        anchor_field_idx = None
+        if group.spec.mode == "natural":
+            anchor_field_idx = group.field_query_ids.index(group.spec.anchor_query_id)
+            seed = group.instance_seed[inst]
+            if seed is not None:
+                rec.anchor_span = group.instance_spans[inst]
+
+        for f_idx, fspec in enumerate(group.field_specs):
+            qid = fspec.query_id
+            spans_tensor = group.field_spans[f_idx]
+            logits_row = group.assign_logits[f_idx][inst].detach() / temperature
+            if anchor_field_idx is not None and f_idx == anchor_field_idx:
+                if rec.anchor_span is not None:
+                    rec.fields.setdefault(qid, []).append(rec.anchor_span)
+                continue
+
+            if fspec.cardinality.is_scalar:
+                probs = torch.softmax(logits_row, dim=-1)
+                chosen = None
+                for col in torch.argsort(probs, descending=True).tolist():
+                    if col == 0:
+                        chosen = 0
+                        break
+                    cand_idx = col - 1
+                    if fspec.exclusive and (f_idx, cand_idx) in used_exclusive:
+                        continue
+                    chosen = col
+                    break
+                if chosen is None or chosen == 0:
+                    continue
+                if float(probs[chosen]) < field_threshold and fspec.allows_absent:
+                    continue
+                cand_idx = chosen - 1
+                span = (int(spans_tensor[cand_idx, 0]), int(spans_tensor[cand_idx, 1]))
+                rec.fields.setdefault(qid, []).append(span)
+                if fspec.exclusive:
+                    used_exclusive.add((f_idx, cand_idx))
+            else:
+                cand_logits = logits_row[1:]
+                if cand_logits.numel() == 0:
+                    continue
+                probs = torch.sigmoid(cand_logits)
+                selected: List[Tuple[int, int]] = []
+                for cand_idx in range(cand_logits.shape[0]):
+                    if float(probs[cand_idx]) < field_threshold:
+                        continue
+                    if fspec.exclusive and (f_idx, cand_idx) in used_exclusive:
+                        continue
+                    span = (int(spans_tensor[cand_idx, 0]), int(spans_tensor[cand_idx, 1]))
+                    selected.append(span)
+                    if fspec.exclusive:
+                        used_exclusive.add((f_idx, cand_idx))
+                if selected:
+                    rec.fields.setdefault(qid, []).extend(selected)
+        if rec.fields:
+            records.append(rec)
+
+    if group.spec.mode in ("latent", "anchorless"):
+        best: Dict[Tuple, DecodedRecord] = {}
+        for rec in records:
+            key = _dedup_key(rec)
+            if key not in best or rec.score > best[key].score:
+                best[key] = rec
+        records = list(best.values())
+    return records
+
+
+def derive_count(records: List[DecodedRecord]) -> int:
+    """Record count is the number of selected instances - never predicted."""
+    return len(records)
+
+
+# =============================================================================
+# Record training losses
+# =============================================================================
+
+def _span_index(field_spans: torch.LongTensor) -> Dict[Tuple[int, int], int]:
+    return {(int(field_spans[i, 0]), int(field_spans[i, 1])): i for i in range(field_spans.shape[0])}
+
+
+def _resolve_value_cols(value_alternatives, span_to_idx):
+    return [
+        idx + 1 for span in value_alternatives
+        if (idx := span_to_idx.get((int(span[0]), int(span[1])))) is not None
+    ]
+
+
+def _scalar_field_nll(logits_row: torch.Tensor, target_cols) -> torch.Tensor:
+    logp = F.log_softmax(logits_row, dim=-1)
+    idx = torch.tensor(target_cols or [0], dtype=torch.long, device=logits_row.device)
+    return -torch.logsumexp(logp[idx], dim=-1)
+
+
+def _list_field_bce(logits_row: torch.Tensor, positive_cols) -> torch.Tensor:
+    cand_logits = logits_row[1:]
+    if cand_logits.numel() == 0:
+        return logits_row.new_zeros(())
+    target = torch.zeros_like(cand_logits)
+    for col in positive_cols:
+        target[col - 1] = 1.0
+    return F.binary_cross_entropy_with_logits(cand_logits, target, reduction="mean")
+
+
+def _field_target_cols(fspec, record: RecordTarget, span_to_idx):
+    ft = record.field_for_query(fspec.query_id)
+    if fspec.cardinality.is_scalar:
+        return (
+            _resolve_value_cols(ft.values[0], span_to_idx)
+            if ft is not None and ft.values else [],
+            True,
+        )
+    cols = []
+    if ft is not None:
+        for value in ft.values:
+            cols.extend(_resolve_value_cols(value, span_to_idx))
+    return cols, False
+
+
+def _instance_field_loss(group, inst: int, record: RecordTarget, span_indices) -> torch.Tensor:
+    total = group.object_logits.new_zeros(())
+    n_fields = 0
+    for f_idx, fspec in enumerate(group.field_specs):
+        cols, is_scalar = _field_target_cols(fspec, record, span_indices[f_idx])
+        row = group.assign_logits[f_idx][inst]
+        total = total + (
+            _scalar_field_nll(row, cols)
+            if is_scalar else _list_field_bce(row, cols)
+        )
+        n_fields += 1
+    return total / max(n_fields, 1)
+
+
+def _instance_field_logprob(group, inst: int, record: RecordTarget, span_indices) -> torch.Tensor:
+    total = group.object_logits.new_zeros(())
+    for f_idx, fspec in enumerate(group.field_specs):
+        cols, is_scalar = _field_target_cols(fspec, record, span_indices[f_idx])
+        row = group.assign_logits[f_idx][inst]
+        if is_scalar:
+            total = total - _scalar_field_nll(row, cols)
+        else:
+            cand_logits = row[1:]
+            if cand_logits.numel() == 0:
+                continue
+            target = torch.zeros_like(cand_logits)
+            for col in cols:
+                target[col - 1] = 1.0
+            total = total - F.binary_cross_entropy_with_logits(cand_logits, target, reduction="sum")
+    return total
+
+
+def _dense_gold_indicator(
+    group: DenseRecordGroupOutput,
+    records: Sequence[RecordTarget],
+) -> torch.BoolTensor:
+    """Map padded gold span alternatives to the shared pool on device."""
+    n_gold = len(records)
+    fields = len(group.field_specs)
+    max_alternatives = max(
+        (
+            len(alternatives)
+            for record in records
+            for field_spec in group.field_specs
+            for target in [record.field_for_query(field_spec.query_id)]
+            if target is not None
+            for alternatives in target.values
+        ),
+        default=1,
+    )
+    max_values = max(
+        (
+            len(target.values)
+            for record in records
+            for field_spec in group.field_specs
+            for target in [record.field_for_query(field_spec.query_id)]
+            if target is not None
+        ),
+        default=1,
+    )
+    gold_spans = torch.zeros(
+        n_gold, fields, max_values, max_alternatives, 2,
+        dtype=torch.long, device=group.pool_spans.device,
+    )
+    gold_mask = torch.zeros(
+        n_gold, fields, max_values, max_alternatives,
+        dtype=torch.bool, device=group.pool_spans.device,
+    )
+    # This is schema/annotation packing only; candidate matching below is one
+    # broadcasted device comparison and never inspects candidate values in Python.
+    for gold_index, record in enumerate(records):
+        for field_index, field_spec in enumerate(group.field_specs):
+            target = record.field_for_query(field_spec.query_id)
+            if target is None:
+                continue
+            for value_index, alternatives in enumerate(target.values):
+                if alternatives:
+                    count = len(alternatives)
+                    gold_spans[gold_index, field_index, value_index, :count] = (
+                        torch.as_tensor(
+                            alternatives, dtype=torch.long,
+                            device=group.pool_spans.device,
+                        )
+                    )
+                    gold_mask[gold_index, field_index, value_index, :count] = True
+    matches = (
+        group.pool_spans[None, None, None, None, :, :]
+        == gold_spans[..., None, :]
+    ).all(-1)
+    matches &= gold_mask[..., None]
+    return matches.any(2).any(2) & group.field_membership[None, :, :]
+
+
+def build_dense_record_cost(
+    group: DenseRecordGroupOutput,
+    gold_indicator: torch.BoolTensor,
+) -> torch.Tensor:
+    """Vectorized ``[I,N_gold]`` matching cost for one dense group."""
+    n_gold = gold_indicator.shape[0]
+    if n_gold == 0:
+        return group.object_logits.new_zeros((group.num_instances, 0))
+    scalar = torch.as_tensor(
+        [field.cardinality.is_scalar for field in group.field_specs],
+        dtype=torch.bool,
+        device=group.object_logits.device,
+    )
+    return build_dense_record_matching_cost(
+        group.object_logits,
+        group.assign_logits,
+        gold_indicator,
+        scalar,
+        group.instance_mask,
+    )
+
+
+def compute_dense_group_loss(
+    group: DenseRecordGroupOutput,
+    records: Sequence[RecordTarget],
+    gold_indicator: Optional[torch.BoolTensor] = None,
+) -> Dict[str, torch.Tensor]:
+    """Loss for the dense shared-pool representation."""
+    device = group.object_logits.device
+    zero = group.object_logits.new_zeros(())
+    count = len(records)
+    ni = group.num_instances
+    # Record matching already has an explicit CPU boundary for Hungarian.
+    # Capacity must use real hypotheses, not the padded tensor width.
+    available_instances = int(group.instance_mask.detach().sum().cpu())
+    if count == 0:
+        target = torch.zeros_like(group.object_logits)
+        losses = F.binary_cross_entropy_with_logits(
+            group.object_logits, target, reduction="none"
+        )
+        object_loss = (
+            losses * group.instance_mask.to(losses.dtype)
+        ).sum() / group.instance_mask.sum().clamp_min(1)
+        return {
+            "object_loss": object_loss,
+            "field_loss": zero,
+            "object_count": available_instances,
+            "field_count": 0,
+        }
+    if available_instances < count:
+        raise TargetCapacityError(
+            f"record group task={group.spec.task_index} has {count} gold instances "
+            f"but only {available_instances} valid instance hypotheses "
+            f"(padded width={ni}, mode={group.spec.mode}); "
+            "increase boundary_head.record_instance_queries or candidate budget."
+        )
+    gold = (
+        _dense_gold_indicator(group, records)
+        if gold_indicator is None
+        else gold_indicator.to(device=device, dtype=torch.bool)
+    )
+    scalar = torch.as_tensor(
+        [field.cardinality.is_scalar for field in group.field_specs],
+        dtype=torch.bool, device=device,
+    )
+    present = gold.any(-1)
+    target = torch.cat(((~present).unsqueeze(-1), gold), -1)
+    logp = F.log_softmax(group.assign_logits, -1)
+    scalar_nll = -torch.logsumexp(
+        logp[:, None].masked_fill(~target[None], MASK_LOGIT), -1
+    )
+    list_nll = F.binary_cross_entropy_with_logits(
+        group.assign_logits[:, None, :, 1:].expand(-1, count, -1, -1),
+        gold[None].expand(ni, -1, -1, -1).to(group.object_logits.dtype),
+        reduction="none",
+    ).mean(-1)
+    field_nll = torch.where(
+        scalar[None, None], scalar_nll, list_nll
+    ).mean(-1)
+
+    if group.spec.mode == "natural":
+        anchor_field = group.field_query_ids == group.spec.anchor_query_id
+        anchor_index = anchor_field.to(torch.long).argmax()
+        anchor_gold = gold[:, anchor_index]
+        anchor_present = anchor_gold.any(-1)
+        matched_cols = torch.arange(count, device=device)[anchor_present]
+        matched_rows = anchor_gold[anchor_present].to(torch.long).argmax(-1)
+        object_loss = zero
+    else:
+        with torch.no_grad():
+            cost = build_dense_record_cost(group, gold)
+        rows, cols = linear_sum_assignment(cost)
+        matched_rows = rows.to(device)
+        matched_cols = cols.to(device)
+        object_target = torch.zeros_like(group.object_logits)
+        object_target.scatter_(0, matched_rows, 1.0)
+        object_terms = F.binary_cross_entropy_with_logits(
+            group.object_logits, object_target, reduction="none"
+        )
+        object_loss = (
+            object_terms * group.instance_mask.to(object_terms.dtype)
+        ).sum() / group.instance_mask.sum().clamp_min(1)
+    field_loss = (
+        field_nll[matched_rows, matched_cols].mean()
+        if matched_rows.numel()
+        else zero
+    )
+    return {
+        "object_loss": object_loss,
+        "field_loss": field_loss,
+        "object_count": available_instances,
+        "field_count": matched_cols.numel() * len(group.field_specs),
+    }
+
+
+def compute_dense_batch_loss(
+    output: DenseRecordBatchOutput,
+    gold_indicator: torch.BoolTensor,
+    record_mask: torch.BoolTensor,
+) -> Dict[str, torch.Tensor]:
+    """Vectorized record loss; only Hungarian assignment remains per group."""
+    device = output.object_logits.device
+    record_mask = record_mask.to(device)
+    present = gold_indicator.any(-1)
+    target = torch.cat(((~present).unsqueeze(-1), gold_indicator), -1)
+    logp = F.log_softmax(output.assign_logits, -1)
+    scalar_nll = -torch.logsumexp(
+        logp.unsqueeze(3).masked_fill(
+            ~target.unsqueeze(2), MASK_LOGIT
+        ),
+        -1,
+    )
+    candidates = output.assign_logits[..., 1:]
+    list_nll = F.binary_cross_entropy_with_logits(
+        candidates.unsqueeze(3).expand(
+            *candidates.shape[:3],
+            gold_indicator.shape[2],
+            candidates.shape[3],
+            candidates.shape[4],
+        ),
+        gold_indicator.unsqueeze(2).expand(
+            *gold_indicator.shape[:2],
+            output.object_logits.shape[2],
+            gold_indicator.shape[2],
+            gold_indicator.shape[3],
+            gold_indicator.shape[4],
+        ).to(candidates.dtype),
+        reduction="none",
+    ).mean(-1)
+    field_nll = torch.where(
+        output.scalar_fields[:, :, None, None, :],
+        scalar_nll,
+        list_nll,
+    )
+    field_nll = (
+        field_nll * output.field_mask[:, :, None, None, :].to(field_nll.dtype)
+    ).sum(-1) / output.field_mask.sum(-1)[:, :, None, None].clamp_min(1)
+
+    with torch.no_grad():
+        cost = build_dense_record_matching_cost(
+            output.object_logits,
+            output.assign_logits,
+            gold_indicator,
+            output.scalar_fields,
+            output.instance_mask,
+        )
+        # One explicit host transfer covers capacity checks and the unavoidable
+        # Hungarian matching boundary for every latent/anchorless group.
+        cost_cpu = cost.detach().cpu()
+        metadata = torch.stack(
+            (
+                output.instance_mask.sum(-1),
+                record_mask.sum(-1),
+                output.modes,
+                output.group_mask.to(torch.long),
+            ),
+            -1,
+        ).cpu()
+        natural_gold = gold_indicator.gather(
+            3,
+            output.anchor_fields.clamp(min=0)[..., None, None, None].expand(
+                *gold_indicator.shape[:3], 1, gold_indicator.shape[-1]
+            ),
+        ).squeeze(3).cpu()
+        matched_batch: list[int] = []
+        matched_group: list[int] = []
+        matched_rows: list[int] = []
+        matched_cols: list[int] = []
+        bsz, groups = output.group_mask.shape
+        for batch_index in range(bsz):
+            for group_index in range(groups):
+                available, count, mode, valid = metadata[
+                    batch_index, group_index
+                ].tolist()
+                if not valid:
+                    continue
+                if available < count:
+                    raise TargetCapacityError(
+                        f"record group batch={batch_index} group={group_index} "
+                        f"has {count} gold instances but only {available} valid "
+                        "instance hypotheses"
+                    )
+                if count == 0:
+                    continue
+                if mode == 0:
+                    anchors = natural_gold[
+                        batch_index, group_index, :count
+                    ]
+                    columns = torch.nonzero(
+                        anchors.any(-1), as_tuple=False
+                    ).flatten()
+                    rows = anchors[columns].to(torch.long).argmax(-1)
+                else:
+                    rows, columns = linear_sum_assignment(
+                        cost_cpu[batch_index, group_index, :, :count]
+                    )
+                matched_batch.extend([batch_index] * len(rows))
+                matched_group.extend([group_index] * len(rows))
+                matched_rows.extend(rows.tolist())
+                matched_cols.extend(columns.tolist())
+    index = tuple(
+        torch.as_tensor(values, dtype=torch.long, device=device)
+        for values in (
+            matched_batch,
+            matched_group,
+            matched_rows,
+            matched_cols,
+        )
+    )
+    object_target = torch.zeros_like(output.object_logits)
+    non_natural = output.modes[index[0], index[1]] != 0
+    object_target[
+        index[0][non_natural],
+        index[1][non_natural],
+        index[2][non_natural],
+    ] = 1.0
+    object_keep = (
+        output.instance_mask
+        & output.group_mask[..., None]
+        & (output.modes != 0)[..., None]
+    )
+    object_terms = F.binary_cross_entropy_with_logits(
+        output.object_logits, object_target, reduction="none"
+    )
+    object_loss = (
+        object_terms * object_keep.to(object_terms.dtype)
+    ).sum() / object_keep.sum().clamp_min(1)
+    field_loss = (
+        field_nll[index].mean()
+        if index[0].numel()
+        else output.object_logits.new_zeros(())
+    )
+    return {"object_loss": object_loss, "field_loss": field_loss}
+
+
+def compute_group_loss(group: RecordGroupOutput, records: Sequence[RecordTarget]) -> Dict[str, torch.Tensor]:
+    """Compute object and field-assignment losses for one record group."""
+    device = group.object_logits.device
+    zero = torch.zeros((), device=device)
+    span_indices = [_span_index(spans) for spans in group.field_spans]
+    ni = group.num_instances
+    if group.spec.mode == "natural":
+        anchor_qid = group.spec.anchor_query_id
+        anchor_f_idx = group.field_query_ids.index(anchor_qid)
+        seed_to_inst = {
+            seed[1]: i for i, seed in enumerate(group.instance_seed)
+            if seed is not None and seed[0] == anchor_f_idx
+        }
+        field_loss, n = zero, 0
+        for record in records:
+            aft = record.field_for_query(anchor_qid)
+            if aft is None or not aft.values:
+                continue
+            cols = _resolve_value_cols(aft.values[0], span_indices[anchor_f_idx])
+            if not cols or (inst := seed_to_inst.get(cols[0] - 1)) is None:
+                continue
+            field_loss = field_loss + _instance_field_loss(group, inst, record, span_indices)
+            n += 1
+        return {
+            "object_loss": zero,
+            "field_loss": field_loss / max(n, 1),
+            "object_count": 0,
+            "field_count": n * len(group.field_specs),
+        }
+
+    count = len(records)
+    if count == 0:
+        obj_target = torch.zeros(ni, device=device)
+        object_loss = F.binary_cross_entropy_with_logits(group.object_logits, obj_target) if ni else zero
+        return {
+            "object_loss": object_loss,
+            "field_loss": zero,
+            "object_count": ni,
+            "field_count": 0,
+        }
+    if ni < count:
+        raise TargetCapacityError(
+            f"record group task={group.spec.task_index} has {count} gold instances "
+            f"but only {ni} instance hypotheses (mode={group.spec.mode}); "
+            "increase boundary_head.record_instance_queries or candidate budget."
+        )
+    # The assignment cost only feeds the (non-differentiable) Hungarian solver,
+    # so build it without autograd; matched object/field losses are rebuilt with
+    # gradients below. This avoids constructing and discarding an Ni x count graph.
+    with torch.no_grad():
+        obj_logp = F.logsigmoid(group.object_logits)
+        cost = torch.zeros(ni, count, device=device)
+        for i in range(ni):
+            for j, record in enumerate(records):
+                cost[i, j] = -(obj_logp[i] + _instance_field_logprob(group, i, record, span_indices))
+    row_ind, col_ind = linear_sum_assignment(cost)
+    matched_rows = {int(row) for row in row_ind.tolist()}
+    obj_target = torch.zeros(ni, device=device)
+    for row in matched_rows:
+        obj_target[row] = 1.0
+    object_loss = F.binary_cross_entropy_with_logits(group.object_logits, obj_target)
+    field_loss = zero
+    for row, col in zip(row_ind.tolist(), col_ind.tolist()):
+        field_loss = field_loss + _instance_field_loss(group, int(row), records[int(col)], span_indices)
+    return {
+        "object_loss": object_loss,
+        "field_loss": field_loss / max(len(row_ind), 1),
+        "object_count": ni,
+        "field_count": len(row_ind) * len(group.field_specs),
+    }

@@ -53,8 +53,28 @@ def test_f1_from_counts():
     assert round(p, 3) == 0.667
     assert round(r, 3) == 0.667
     assert round(f, 3) == 0.667
-    # No predictions and no gold -> perfect by convention.
-    assert f1_from_counts(0, 0, 0) == (1.0, 1.0, 1.0)
+    # No predictions and no gold -> zero by sklearn convention (a model that
+    # produces nothing must not score perfectly).
+    assert f1_from_counts(0, 0, 0) == (0.0, 0.0, 0.0)
+    # zero_division is configurable for callers that want the old behavior.
+    assert f1_from_counts(0, 0, 0, zero_division=1.0) == (1.0, 1.0, 1.0)
+
+
+def test_recall_helpers_empty_denominator_report_zero():
+    # No gold mentions -> oracle recall 0.0 (not 1.0).
+    targets = pad_target_graphs(
+        [TargetGraph(mentions=())], [1], [5], max_gold_per_query=4,
+    )
+    idx = torch.tensor([[[[0, 2], [1, 4], [0, 0]]]])
+    valid = torch.tensor([[[True, True, False]]])
+    qm = torch.ones(1, 1, dtype=torch.bool)
+    assert candidate_oracle_recall(_candidates(idx, valid, qm), targets) == 0.0
+
+    # No gold boundaries -> boundary recall 0.0.
+    logits = torch.tensor([[[2.0, -1.0, 3.0]]])
+    zero_targets = torch.zeros(1, 1, 3)
+    keep = torch.ones(1, 1, 3, dtype=torch.bool)
+    assert boundary_recall(logits, zero_targets, keep, threshold=0.0) == 0.0
 
 
 def test_exact_span_counts_and_gold_helper():

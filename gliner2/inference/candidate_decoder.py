@@ -195,4 +195,36 @@ __all__ = [
     "apply_overlap_policy",
     "stable_candidate_sort_key",
     "format_candidate",
+    "RawSpan",
+    "finalize_spans",
 ]
+
+
+# --- final span selection ---
+
+RawSpan = Tuple[str, float, int, int]
+
+
+def finalize_spans(
+    raw_spans: Sequence[RawSpan],
+    *,
+    dtype: str = "list",
+    gate_open: bool = True,
+    suppress: bool = True,
+) -> List[RawSpan]:
+    """Decode thresholded entity spans using the production contract."""
+    if not gate_open:
+        return []
+    spans = sorted(raw_spans, key=lambda span: (-span[1], span[2], span[3]))
+    if suppress:
+        kept: List[RawSpan] = []
+        for span in spans:
+            _, _, start, end = span
+            if any(
+                not (end <= kept_start or start >= kept_end)
+                for _, _, kept_start, kept_end in kept
+            ):
+                continue
+            kept.append(span)
+        spans = kept
+    return spans if dtype == "list" else spans[:1]

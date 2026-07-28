@@ -50,6 +50,17 @@ def test_head_only_overfit_recovers_long_and_nested_spans():
         ends_per_start=8, starts_per_end=8, candidate_budget=128,
         training_candidate_budget=160, max_gold_per_query=32,
         end_block_size=16, dropout=0.0,
+        # This is the primary-objective overfit gate. Auxiliary objectives have
+        # separate contracts and schedules in test_pr18_pr22_contracts.py.
+        proposal_loss_weight=0.0,
+        consistency_loss_weight=0.0,
+        rerank_listwise_weight=0.0,
+        soft_iou_aux_weight=0.0,
+        enable_abstention=False,
+        abstention_loss_weight=0.0,
+        enable_count_head=False,
+        count_loss_weight=0.0,
+        negative_query_ratio=0.0,
     )
     model = BoundaryHead(H, settings, query_dim=H)
 
@@ -138,3 +149,67 @@ def test_head_components_all_receive_gradients():
         ]
         assert grads, f"no grad tensors for {prefix}"
         assert any(float(g.abs().sum()) > 0 for g in grads), f"zero gradient for {prefix}"
+
+
+@pytest.mark.parametrize(
+    "features",
+    [
+        {"enable_span_content": True},
+        {"enable_rotary_endpoints": True},
+        {"boundary_attention_layers": 1},
+        {
+            "enable_span_content": True,
+            "enable_rotary_endpoints": True,
+            "boundary_attention_layers": 1,
+            "query_conditioned_inside_weight": True,
+            "endpoint_difference_features": True,
+        },
+    ],
+)
+def test_optional_representation_features_overfit_small_batch(features):
+    torch.manual_seed(21)
+    settings = BoundaryHeadSettings(
+        boundary_dim=16,
+        pair_dim=16,
+        start_top_k=8,
+        end_top_k=8,
+        ends_per_start=4,
+        starts_per_end=4,
+        candidate_budget=32,
+        training_candidate_budget=40,
+        max_gold_per_query=4,
+        end_block_size=16,
+        content_dim=8,
+        boundary_attention_heads=4,
+        dropout=0.0,
+        **features,
+    )
+    model = BoundaryHead(16, settings, query_dim=16)
+    tokens = torch.randn(1, 20, 16)
+    text_mask = torch.ones(1, 20, dtype=torch.bool)
+    queries = torch.randn(1, 2, 16)
+    query_mask = torch.ones(1, 2, dtype=torch.bool)
+    targets = pad_target_graphs(
+        [
+            TargetGraph(
+                mentions=(
+                    MentionTarget(0, 2, 8),
+                    MentionTarget(1, 11, 19),
+                )
+            )
+        ],
+        [2],
+        [20],
+        max_gold_per_query=4,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-3, weight_decay=0.0)
+    losses = []
+    model.train()
+    for _ in range(50):
+        optimizer.zero_grad(set_to_none=True)
+        loss = model(tokens, text_mask, queries, query_mask, targets).total_loss
+        assert torch.isfinite(loss)
+        losses.append(float(loss.detach()))
+        loss.backward()
+        optimizer.step()
+    assert losses[-1] < losses[0] * 0.5

@@ -90,7 +90,10 @@ The boundary architecture is **experimental** and supports entities,
 classification, optional structured record/event decoding, and optional sparse
 relation extraction. Records and relations must be enabled when creating the
 boundary checkpoint. See the full guide — loading, creating/training a boundary
-model, record and relation decoding, save/load, LoRA aliases, and export mode — in
+model, record and relation decoding, save/load, LoRA aliases, export mode, the
+new loss/imbalance controls (`boundary_negative_weight`, `boundary_marginal_loss`,
+`classification_loss_weight`), and the gold-capacity policy
+(`TrainingConfig.on_capacity_exceeded`) — in
 [`docs/boundary_architecture.md`](docs/boundary_architecture.md).
 
 ## 📦 Available Models

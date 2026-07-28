@@ -9,7 +9,10 @@ own encode path until parity is proven (per the blueprint).
 
 from __future__ import annotations
 
+import importlib.util
+import logging
 import os
+import warnings
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
@@ -18,6 +21,8 @@ import torch.nn as nn
 from transformers import AutoConfig, AutoModel, PretrainedConfig, PreTrainedModel
 
 from gliner2.configuration import ExtractorConfig
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -112,10 +117,49 @@ class BaseExtractorModel(PreTrainedModel):
     config_class = ExtractorConfig
 
     @staticmethod
-    def _load_encoder(model_name: str, encoder_config: Optional[PretrainedConfig] = None) -> nn.Module:
-        if encoder_config is not None:
-            return AutoModel.from_config(encoder_config, trust_remote_code=True)
-        return AutoModel.from_pretrained(model_name, trust_remote_code=True)
+    def _load_encoder(
+        model_name: str,
+        encoder_config: Optional[PretrainedConfig] = None,
+        attn_implementation: Optional[str] = "sdpa",
+    ) -> nn.Module:
+        """Load a shared optimized encoder with a safe eager fallback."""
+        config = encoder_config
+        if config is None:
+            config = AutoConfig.from_pretrained(
+                model_name, trust_remote_code=True
+            )
+
+        use_flashdeberta = bool(os.environ.get("USE_FLASHDEBERTA")) and (
+            importlib.util.find_spec("flashdeberta") is not None
+        )
+        if config.__class__.__name__ == "DebertaV2Config" and use_flashdeberta:
+            from flashdeberta import FlashDebertaV2Model
+
+            logger.info("Using FlashDeberta backend")
+            if encoder_config is not None:
+                return FlashDebertaV2Model(config)
+            return FlashDebertaV2Model.from_pretrained(model_name)
+
+        def load(implementation: Optional[str]) -> nn.Module:
+            kwargs = {"trust_remote_code": True}
+            if implementation:
+                kwargs["attn_implementation"] = implementation
+            if encoder_config is not None:
+                return AutoModel.from_config(config, **kwargs)
+            return AutoModel.from_pretrained(model_name, **kwargs)
+
+        try:
+            return load(attn_implementation)
+        except (TypeError, ValueError, ImportError) as error:
+            if not attn_implementation or attn_implementation == "eager":
+                raise
+            warnings.warn(
+                f"Encoder rejected attn_implementation={attn_implementation!r}; "
+                f"falling back to 'eager' ({error})",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return load("eager")
 
     def task_module_names(self) -> Tuple[str, ...]:
         raise NotImplementedError

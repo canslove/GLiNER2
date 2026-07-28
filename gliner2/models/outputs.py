@@ -32,7 +32,7 @@ class CandidateTensorBatch:
         query_mask:      [B, Q]        True where the query is real (extractive)
     """
     indices: torch.LongTensor
-    proposal_logits: torch.Tensor
+    proposal_logits: Optional[torch.Tensor]
     pair_logits: torch.Tensor
     valid_mask: torch.BoolTensor
     query_mask: torch.BoolTensor
@@ -46,7 +46,7 @@ class CandidateTensorBatch:
                 f"indices must be [B, Q, C, 2], got {tuple(self.indices.shape)}"
             )
         b, q, c, _ = self.indices.shape
-        if tuple(self.proposal_logits.shape) != (b, q, c):
+        if self.proposal_logits is not None and tuple(self.proposal_logits.shape) != (b, q, c):
             raise ValueError("proposal_logits shape must be [B, Q, C]")
         if tuple(self.pair_logits.shape) != (b, q, c):
             raise ValueError("pair_logits shape must be [B, Q, C]")
@@ -62,7 +62,10 @@ class CandidateTensorBatch:
     def to(self, device) -> "CandidateTensorBatch":
         return CandidateTensorBatch(
             indices=self.indices.to(device),
-            proposal_logits=self.proposal_logits.to(device),
+            proposal_logits=(
+                self.proposal_logits.to(device)
+                if self.proposal_logits is not None else None
+            ),
             pair_logits=self.pair_logits.to(device),
             valid_mask=self.valid_mask.to(device),
             query_mask=self.query_mask.to(device),
@@ -76,6 +79,8 @@ class CandidateTensorBatch:
         """Assert every valid candidate is a legal half-open span in range.
 
         ``0 <= start < end <= text_length`` for the candidate's sample.
+        Debug/decode-only: validation intentionally reads device predicates.
+        It is never called by boundary training or candidate construction.
         """
         b, q, c, _ = self.indices.shape
         starts = self.indices[..., 0]
@@ -94,43 +99,33 @@ class CandidateTensorBatch:
             raise ValueError("found valid candidate with end > text_length")
 
     def pack(self) -> "PackedCandidateBatch":
-        """Flatten valid candidates into a ragged packed representation."""
+        """Flatten valid candidates into a ragged packed representation.
+
+        Flattening is tensorized and preserves the padded row-major order
+        ``(batch, query, candidate)`` exactly.
+        """
         b, q, c, _ = self.indices.shape
-        device = self.indices.device
-        batch_idx: List[int] = []
-        query_idx: List[int] = []
-        starts: List[int] = []
-        ends: List[int] = []
-        prop: List[float] = []
-        pair: List[float] = []
-        offsets: List[int] = [0]
-
-        for bi in range(b):
-            for qi in range(q):
-                if not bool(self.query_mask[bi, qi]):
-                    offsets.append(len(starts))
-                    continue
-                for ci in range(c):
-                    if not bool(self.valid_mask[bi, qi, ci]):
-                        continue
-                    batch_idx.append(bi)
-                    query_idx.append(qi)
-                    starts.append(int(self.indices[bi, qi, ci, 0]))
-                    ends.append(int(self.indices[bi, qi, ci, 1]))
-                    prop.append(float(self.proposal_logits[bi, qi, ci]))
-                    pair.append(float(self.pair_logits[bi, qi, ci]))
-                offsets.append(len(starts))
-
-        long = lambda xs: torch.tensor(xs, dtype=torch.long, device=device)
-        flt = lambda xs: torch.tensor(xs, dtype=self.pair_logits.dtype, device=device)
+        keep = self.valid_mask & self.query_mask.unsqueeze(-1)
+        batch_idx, query_idx, candidate_idx = keep.nonzero(as_tuple=True)
+        selected = self.indices[batch_idx, query_idx, candidate_idx]
+        segment_counts = keep.sum(dim=-1).reshape(-1).to(dtype=torch.long)
+        offsets = torch.cat(
+            (segment_counts.new_zeros(1), segment_counts.cumsum(dim=0))
+        )
+        if self.proposal_logits is None:
+            proposal_logits = self.pair_logits.new_zeros(batch_idx.shape[0])
+        else:
+            proposal_logits = self.proposal_logits[
+                batch_idx, query_idx, candidate_idx
+            ]
         return PackedCandidateBatch(
-            batch_indices=long(batch_idx),
-            query_indices=long(query_idx),
-            starts=long(starts),
-            ends=long(ends),
-            proposal_logits=flt(prop),
-            pair_logits=flt(pair),
-            offsets=long(offsets),
+            batch_indices=batch_idx,
+            query_indices=query_idx,
+            starts=selected[:, 0],
+            ends=selected[:, 1],
+            proposal_logits=proposal_logits,
+            pair_logits=self.pair_logits[batch_idx, query_idx, candidate_idx],
+            offsets=offsets,
             num_queries=q,
         )
 
@@ -224,7 +219,8 @@ class ExtractorOutput:
     models continue to expose
     ``total_loss/classification_loss/structure_loss/count_loss/batch_size``;
     boundary models additionally expose ``start_loss/end_loss/pair_loss/...``
-    via the ``losses`` dict, mirrored as mapping keys.
+    via the ``losses`` dict, mirrored as mapping keys. Boundary
+    ``count_log_rates`` are per-query Poisson log-rates, not raw counts.
     """
     loss: Optional[torch.Tensor] = None
     total_loss: Optional[torch.Tensor] = None
@@ -236,19 +232,23 @@ class ExtractorOutput:
     start_logits: Optional[torch.Tensor] = None
     end_logits: Optional[torch.Tensor] = None
     inside_logits: Optional[torch.Tensor] = None
+    null_logits: Optional[torch.Tensor] = None
+    count_log_rates: Optional[torch.Tensor] = None
     metrics: Optional[Dict[str, torch.Tensor]] = None
     batch_size: int = 0
 
     def __getitem__(self, key):
         # Prefer a real attribute; fall back to the losses dict for component
-        # losses (e.g. "start_loss") so trainers can read them uniformly.
+        # losses (e.g. "start_loss") so trainers can read them uniformly. A
+        # declared-but-``None`` field is treated as absent (consistent with
+        # ``__contains__``) so ``get(key, default)`` returns the default and
+        # ``self[key]`` fails loud rather than yielding ``None``.
         if isinstance(key, str):
-            if hasattr(self, key) and getattr(self, key) is not None:
-                return getattr(self, key)
+            value = getattr(self, key, None)
+            if value is not None:
+                return value
             if self.losses is not None and key in self.losses:
                 return self.losses[key]
-            if hasattr(self, key):
-                return getattr(self, key)
             raise KeyError(key)
         raise KeyError(key)
 

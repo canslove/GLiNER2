@@ -52,25 +52,88 @@ class BoundaryHeadSettings:
     bidirectional_proposals: bool = True
     use_inside_evidence: bool = True
     dropout: float = 0.1
-    export_mode: str = "streaming"  # "streaming" | "vectorized" (export-friendly)
+    export_mode: str = "auto"  # "auto" | "streaming" | "vectorized"
+    vectorized_pair_elements: int = 16_777_216
+    # Boundary marginal loss controls. ``boundary_negative_weight`` down-weights
+    # negative (non-boundary) positions in the start/end/inside multi-label BCE;
+    # 1.0 (default) applies no down-weighting. ``boundary_marginal_loss`` selects
+    # the marginal objective: standard weighted BCE or asymmetric focal loss.
+    boundary_negative_weight: float = 1.0
+    boundary_marginal_loss: str = "bce"  # "bce" | "asymmetric_focal"
+    loss_reduction: str = "global"  # "global" | "per_query"
+    boundary_focal_gamma_positive: float = 0.0
+    boundary_focal_gamma_negative: float = 2.0
+    boundary_focal_clip: float = 0.05
+    hard_negatives_per_positive: int = 5
+    minimum_hard_negatives: int = 8
+    hard_negative_keep_all_when_absent: bool = False
+    # Optional representation upgrades. Defaults preserve existing checkpoint
+    # parameter sets and behavior.
+    enable_span_content: bool = False
+    content_dim: int = 64
+    content_soft_max_pool: bool = False
+    enable_rotary_endpoints: bool = False
+    rotary_base: float = 10000.0
+    boundary_attention_layers: int = 0
+    boundary_attention_heads: int = 4
+    boundary_attention_window: int = 0
+    query_conditioned_inside_weight: bool = False
+    endpoint_difference_features: bool = False
+    reranker_endpoint_compat: bool = True
+    multihead_pair_compat_heads: int = 8
+    boundary_top_k_alpha: float = 0.0
+    boundary_top_k_max: int = 128
+    boundary_top_k_bucket: int = 8
+    # Flag-gated document-level candidate pool (PR-23--28).  ``per_query``
+    # preserves the historical proposal/scoring path exactly.
+    candidate_pool: str = "per_query"  # "per_query" | "shared"
+    pool_boundary_top_k: int = 64
+    pool_size: int = 384
+    min_pool_per_query: int = 8
+    candidate_attention_layers: int = 2
+    candidate_attention_heads: int = 4
+    query_attention_layers: int = 1
+    enable_abstention: bool = True
+    abstention_threshold: float = 0.5
+    proposal_loss_weight: float = 0.3
+    consistency_loss_weight: float = 0.1
+    rerank_listwise_weight: float = 0.3
+    soft_iou_aux_weight: float = 0.2
+    soft_iou_anneal_steps: int = 20_000
+    abstention_loss_weight: float = 0.2
+    consistency_warmup_steps: int = 2000
+    enable_count_head: bool = True
+    count_loss_weight: float = 0.2
+    adaptive_threshold: bool = False
+    overlap_policy: str = "flat"  # "flat" | "nested" | "longest"
+    pair_temperature: float = 1.0
+    relation_temperature: float = 1.0
+    record_temperature: float = 1.0
+    classification_temperature: float = 1.0
+    negative_query_ratio: float = 0.5
+    max_negative_queries_per_batch: int = 64
+    # Weight on the (label-count-normalized) classification BCE when combined
+    # with the boundary losses.
+    classification_loss_weight: float = 1.0
     # -- Record / instance-formation head (Instance Formation & Record
-    # Disambiguation). Disabled by default so existing boundary checkpoints and
-    # entity-only models are byte-for-byte unaffected. Only architecture-wide
-    # *capacities* live here; per-schema mode/anchor is side metadata.
-    enable_records: bool = False
+    # Disambiguation). New boundary configurations include the structured
+    # modules; migration keeps checkpoints which omitted these flags disabled.
+    enable_records: bool = True
     record_dim: int = 128
     record_instance_queries: int = 32       # anchorless / latent capacity
     record_anchor_proposal_threshold: float = 0.2   # lower rescue threshold
     record_anchor_threshold: float = 0.5    # final anchor selection threshold
     record_field_threshold: float = 0.5     # list-field / null decision cutoff
     record_loss_weight: float = 1.0
-    # Sparse typed relation scorer. Disabled by default so boundary checkpoints
-    # without this head retain their existing state-dict shape.
-    enable_relations: bool = False
+    # Sparse typed relation scorer.
+    enable_relations: bool = True
     relation_heads_per_type: int = 32
     relation_tails_per_type: int = 32
     relation_pair_cap: int = 128
     relation_loss_weight: float = 1.0
+    relation_argument_proposal_threshold: float = 0.0
+    directional_relation_states: bool = False
+    relation_biaffine_content: bool = False
 
 
 # =============================================================================
@@ -140,6 +203,163 @@ def validate_boundary_head(values: Mapping[str, Any]) -> dict:
         ),
         "dropout": float(values.get("dropout", d.dropout)),
         "export_mode": str(values.get("export_mode", d.export_mode)),
+        "vectorized_pair_elements": int(
+            values.get("vectorized_pair_elements", d.vectorized_pair_elements)
+        ),
+        "boundary_negative_weight": float(
+            values.get("boundary_negative_weight", d.boundary_negative_weight)
+        ),
+        "boundary_marginal_loss": str(
+            values.get("boundary_marginal_loss", d.boundary_marginal_loss)
+        ),
+        "loss_reduction": str(values.get("loss_reduction", d.loss_reduction)),
+        "boundary_focal_gamma_positive": float(
+            values.get("boundary_focal_gamma_positive", d.boundary_focal_gamma_positive)
+        ),
+        "boundary_focal_gamma_negative": float(
+            values.get("boundary_focal_gamma_negative", d.boundary_focal_gamma_negative)
+        ),
+        "boundary_focal_clip": float(
+            values.get("boundary_focal_clip", d.boundary_focal_clip)
+        ),
+        "hard_negatives_per_positive": int(
+            values.get("hard_negatives_per_positive", d.hard_negatives_per_positive)
+        ),
+        "minimum_hard_negatives": int(
+            values.get("minimum_hard_negatives", d.minimum_hard_negatives)
+        ),
+        "hard_negative_keep_all_when_absent": bool(
+            values.get(
+                "hard_negative_keep_all_when_absent",
+                d.hard_negative_keep_all_when_absent,
+            )
+        ),
+        "enable_span_content": bool(
+            values.get("enable_span_content", d.enable_span_content)
+        ),
+        "content_dim": int(values.get("content_dim", d.content_dim)),
+        "content_soft_max_pool": bool(
+            values.get("content_soft_max_pool", d.content_soft_max_pool)
+        ),
+        "enable_rotary_endpoints": bool(
+            values.get("enable_rotary_endpoints", d.enable_rotary_endpoints)
+        ),
+        "rotary_base": float(values.get("rotary_base", d.rotary_base)),
+        "boundary_attention_layers": int(
+            values.get("boundary_attention_layers", d.boundary_attention_layers)
+        ),
+        "boundary_attention_heads": int(
+            values.get("boundary_attention_heads", d.boundary_attention_heads)
+        ),
+        "boundary_attention_window": int(
+            values.get("boundary_attention_window", d.boundary_attention_window)
+        ),
+        "query_conditioned_inside_weight": bool(
+            values.get(
+                "query_conditioned_inside_weight",
+                d.query_conditioned_inside_weight,
+            )
+        ),
+        "endpoint_difference_features": bool(
+            values.get("endpoint_difference_features", d.endpoint_difference_features)
+        ),
+        "reranker_endpoint_compat": bool(
+            values.get("reranker_endpoint_compat", d.reranker_endpoint_compat)
+        ),
+        "multihead_pair_compat_heads": int(
+            values.get(
+                "multihead_pair_compat_heads", d.multihead_pair_compat_heads
+            )
+        ),
+        "boundary_top_k_alpha": float(
+            values.get("boundary_top_k_alpha", d.boundary_top_k_alpha)
+        ),
+        "boundary_top_k_max": int(
+            values.get("boundary_top_k_max", d.boundary_top_k_max)
+        ),
+        "boundary_top_k_bucket": int(
+            values.get("boundary_top_k_bucket", d.boundary_top_k_bucket)
+        ),
+        "candidate_pool": str(values.get("candidate_pool", d.candidate_pool)),
+        "pool_boundary_top_k": int(
+            values.get("pool_boundary_top_k", d.pool_boundary_top_k)
+        ),
+        "pool_size": int(values.get("pool_size", d.pool_size)),
+        "min_pool_per_query": int(
+            values.get("min_pool_per_query", d.min_pool_per_query)
+        ),
+        "candidate_attention_layers": int(
+            values.get("candidate_attention_layers", d.candidate_attention_layers)
+        ),
+        "candidate_attention_heads": int(
+            values.get("candidate_attention_heads", d.candidate_attention_heads)
+        ),
+        "query_attention_layers": int(
+            values.get("query_attention_layers", d.query_attention_layers)
+        ),
+        "enable_abstention": bool(
+            values.get("enable_abstention", d.enable_abstention)
+        ),
+        "abstention_threshold": float(
+            values.get("abstention_threshold", d.abstention_threshold)
+        ),
+        "proposal_loss_weight": float(
+            values.get("proposal_loss_weight", d.proposal_loss_weight)
+        ),
+        "consistency_loss_weight": float(
+            values.get("consistency_loss_weight", d.consistency_loss_weight)
+        ),
+        "rerank_listwise_weight": float(
+            values.get("rerank_listwise_weight", d.rerank_listwise_weight)
+        ),
+        "soft_iou_aux_weight": float(
+            values.get("soft_iou_aux_weight", d.soft_iou_aux_weight)
+        ),
+        "soft_iou_anneal_steps": int(
+            values.get("soft_iou_anneal_steps", d.soft_iou_anneal_steps)
+        ),
+        "abstention_loss_weight": float(
+            values.get("abstention_loss_weight", d.abstention_loss_weight)
+        ),
+        "consistency_warmup_steps": int(
+            values.get("consistency_warmup_steps", d.consistency_warmup_steps)
+        ),
+        "enable_count_head": bool(
+            values.get("enable_count_head", d.enable_count_head)
+        ),
+        "count_loss_weight": float(
+            values.get("count_loss_weight", d.count_loss_weight)
+        ),
+        "adaptive_threshold": bool(
+            values.get("adaptive_threshold", d.adaptive_threshold)
+        ),
+        "overlap_policy": str(values.get("overlap_policy", d.overlap_policy)),
+        "pair_temperature": float(
+            values.get("pair_temperature", d.pair_temperature)
+        ),
+        "relation_temperature": float(
+            values.get("relation_temperature", d.relation_temperature)
+        ),
+        "record_temperature": float(
+            values.get("record_temperature", d.record_temperature)
+        ),
+        "classification_temperature": float(
+            values.get(
+                "classification_temperature", d.classification_temperature
+            )
+        ),
+        "negative_query_ratio": float(
+            values.get("negative_query_ratio", d.negative_query_ratio)
+        ),
+        "max_negative_queries_per_batch": int(
+            values.get(
+                "max_negative_queries_per_batch",
+                d.max_negative_queries_per_batch,
+            )
+        ),
+        "classification_loss_weight": float(
+            values.get("classification_loss_weight", d.classification_loss_weight)
+        ),
         "enable_records": bool(values.get("enable_records", d.enable_records)),
         "record_dim": int(values.get("record_dim", d.record_dim)),
         "record_instance_queries": int(
@@ -172,11 +392,170 @@ def validate_boundary_head(values: Mapping[str, Any]) -> dict:
         "relation_loss_weight": float(
             values.get("relation_loss_weight", d.relation_loss_weight)
         ),
+        "relation_argument_proposal_threshold": float(
+            values.get(
+                "relation_argument_proposal_threshold",
+                d.relation_argument_proposal_threshold,
+            )
+        ),
+        "directional_relation_states": bool(
+            values.get("directional_relation_states", d.directional_relation_states)
+        ),
+        "relation_biaffine_content": bool(
+            values.get("relation_biaffine_content", d.relation_biaffine_content)
+        ),
     }
-    if result["export_mode"] not in ("streaming", "vectorized"):
+    if result["export_mode"] not in ("auto", "streaming", "vectorized"):
         raise ValueError(
-            f"boundary_head.export_mode must be 'streaming' or 'vectorized', "
+            f"boundary_head.export_mode must be 'auto', 'streaming', or 'vectorized', "
             f"got {result['export_mode']!r}"
+        )
+    if result["vectorized_pair_elements"] <= 0:
+        raise ValueError("boundary_head.vectorized_pair_elements must be > 0")
+    if not 0.0 < result["boundary_negative_weight"] <= 1.0:
+        raise ValueError(
+            "boundary_head.boundary_negative_weight must be in (0, 1], got "
+            f"{result['boundary_negative_weight']}"
+        )
+    if result["boundary_marginal_loss"] not in ("bce", "asymmetric_focal"):
+        raise ValueError(
+            "boundary_head.boundary_marginal_loss must be 'bce' or "
+            f"'asymmetric_focal', got {result['boundary_marginal_loss']!r}"
+        )
+    if result["loss_reduction"] not in ("global", "per_query"):
+        raise ValueError(
+            "boundary_head.loss_reduction must be 'global' or 'per_query', got "
+            f"{result['loss_reduction']!r}"
+        )
+    if (
+        result["boundary_focal_gamma_positive"] < 0
+        or result["boundary_focal_gamma_negative"] < 0
+    ):
+        raise ValueError("boundary_head focal gamma values must be >= 0")
+    if not 0.0 <= result["boundary_focal_clip"] < 1.0:
+        raise ValueError("boundary_head.boundary_focal_clip must be in [0, 1)")
+    if result["hard_negatives_per_positive"] < 0 or result["minimum_hard_negatives"] < 0:
+        raise ValueError("boundary_head hard-negative counts must be >= 0")
+    if result["content_dim"] <= 0:
+        raise ValueError("boundary_head.content_dim must be > 0")
+    if result["rotary_base"] <= 0:
+        raise ValueError("boundary_head.rotary_base must be > 0")
+    if result["enable_rotary_endpoints"] and (
+        result["boundary_dim"] % 2 or result["pair_dim"] % 2
+    ):
+        raise ValueError(
+            "boundary_head.enable_rotary_endpoints requires even boundary_dim "
+            f"and pair_dim, got {result['boundary_dim']} and {result['pair_dim']}"
+        )
+    if result["boundary_attention_layers"] < 0:
+        raise ValueError("boundary_head.boundary_attention_layers must be >= 0")
+    if result["boundary_attention_heads"] <= 0:
+        raise ValueError("boundary_head.boundary_attention_heads must be > 0")
+    if (
+        result["boundary_attention_layers"] > 0
+        and result["boundary_dim"] % result["boundary_attention_heads"]
+    ):
+        raise ValueError(
+            "boundary_head.boundary_dim must be divisible by "
+            "boundary_attention_heads when attention is enabled"
+        )
+    if result["boundary_attention_window"] < 0:
+        raise ValueError("boundary_head.boundary_attention_window must be >= 0")
+    if result["multihead_pair_compat_heads"] <= 0:
+        raise ValueError(
+            "boundary_head.multihead_pair_compat_heads must be > 0"
+        )
+    if result["pair_dim"] % result["multihead_pair_compat_heads"]:
+        raise ValueError(
+            "boundary_head.pair_dim must be divisible by "
+            "multihead_pair_compat_heads, got "
+            f"{result['pair_dim']} and {result['multihead_pair_compat_heads']}"
+        )
+    if result["boundary_top_k_alpha"] < 0:
+        raise ValueError("boundary_head.boundary_top_k_alpha must be >= 0")
+    if result["boundary_top_k_max"] < max(
+        result["start_top_k"], result["end_top_k"]
+    ):
+        raise ValueError(
+            "boundary_head.boundary_top_k_max must be >= start_top_k and end_top_k"
+        )
+    if result["boundary_top_k_bucket"] <= 0:
+        raise ValueError("boundary_head.boundary_top_k_bucket must be > 0")
+    if result["candidate_pool"] not in ("per_query", "shared"):
+        raise ValueError(
+            "boundary_head.candidate_pool must be 'per_query' or 'shared', got "
+            f"{result['candidate_pool']!r}"
+        )
+    for key in ("pool_boundary_top_k", "pool_size"):
+        if result[key] <= 0:
+            raise ValueError(f"boundary_head.{key} must be > 0")
+    if result["min_pool_per_query"] < 0:
+        raise ValueError("boundary_head.min_pool_per_query must be >= 0")
+    if result["min_pool_per_query"] > result["pool_size"]:
+        raise ValueError(
+            "boundary_head.min_pool_per_query must not exceed pool_size"
+        )
+    if result["candidate_attention_layers"] < 0:
+        raise ValueError("boundary_head.candidate_attention_layers must be >= 0")
+    if result["candidate_attention_heads"] <= 0:
+        raise ValueError("boundary_head.candidate_attention_heads must be > 0")
+    if (
+        (
+            result["candidate_attention_layers"] > 0
+            or result["query_attention_layers"] > 0
+        )
+        and result["pair_dim"] % result["candidate_attention_heads"]
+    ):
+        raise ValueError(
+            "boundary_head.pair_dim must be divisible by "
+            "candidate_attention_heads when candidate or query attention is enabled"
+        )
+    if result["query_attention_layers"] < 0:
+        raise ValueError("boundary_head.query_attention_layers must be >= 0")
+    if not 0.0 <= result["abstention_threshold"] <= 1.0:
+        raise ValueError("boundary_head.abstention_threshold must be in [0, 1]")
+    for loss_key in (
+        "proposal_loss_weight",
+        "consistency_loss_weight",
+        "rerank_listwise_weight",
+        "soft_iou_aux_weight",
+        "abstention_loss_weight",
+        "count_loss_weight",
+    ):
+        if result[loss_key] < 0:
+            raise ValueError(f"boundary_head.{loss_key} must be >= 0")
+    if result["consistency_warmup_steps"] < 0:
+        raise ValueError("boundary_head.consistency_warmup_steps must be >= 0")
+    if result["soft_iou_anneal_steps"] < 0:
+        raise ValueError("boundary_head.soft_iou_anneal_steps must be >= 0")
+    if result["overlap_policy"] not in ("flat", "nested", "longest"):
+        raise ValueError(
+            "boundary_head.overlap_policy must be 'flat', 'nested', or 'longest'"
+        )
+    for temperature_key in (
+        "pair_temperature",
+        "relation_temperature",
+        "record_temperature",
+        "classification_temperature",
+    ):
+        if result[temperature_key] <= 0:
+            raise ValueError(f"boundary_head.{temperature_key} must be > 0")
+    if result["negative_query_ratio"] < 0:
+        raise ValueError("boundary_head.negative_query_ratio must be >= 0")
+    if result["max_negative_queries_per_batch"] <= 0:
+        raise ValueError(
+            "boundary_head.max_negative_queries_per_batch must be > 0"
+        )
+    if result["export_mode"] == "vectorized" and result["boundary_top_k_alpha"] > 0:
+        raise ValueError(
+            "boundary_head.export_mode='vectorized' is incompatible with an "
+            "adaptive boundary budget; use 'auto'/'streaming' or set "
+            "boundary_top_k_alpha=0"
+        )
+    if result["classification_loss_weight"] < 0:
+        raise ValueError(
+            "boundary_head.classification_loss_weight must be >= 0, got "
+            f"{result['classification_loss_weight']}"
         )
     if result["record_dim"] <= 0:
         raise ValueError(
@@ -209,6 +588,10 @@ def validate_boundary_head(values: Mapping[str, Any]) -> dict:
         raise ValueError(
             "boundary_head.relation_loss_weight must be >= 0, got "
             f"{result['relation_loss_weight']}"
+        )
+    if not 0.0 <= result["relation_argument_proposal_threshold"] <= 1.0:
+        raise ValueError(
+            "boundary_head.relation_argument_proposal_threshold must be in [0, 1]"
         )
 
     positive_keys = [
@@ -263,11 +646,18 @@ def migrate_config_dict(values: Mapping[str, Any]) -> dict:
         span_head = dict(migrated.get("span_head") or {})
         if "max_width" in migrated and migrated["max_width"] is not None:
             span_head.setdefault("max_width", migrated["max_width"])
+        # Drop the migrated top-level key so ``span_head`` is the single source
+        # of truth (avoids two diverging copies of ``max_width``).
+        migrated.pop("max_width", None)
         migrated["span_head"] = validate_span_head(span_head)
     else:
-        migrated["boundary_head"] = validate_boundary_head(
-            dict(migrated.get("boundary_head") or {})
-        )
+        boundary_head = dict(migrated.get("boundary_head") or {})
+        # Configs written before structured heads became the default must not
+        # silently gain parameters when loaded.
+        if int(migrated.get("config_version") or 0) < 3:
+            boundary_head.setdefault("enable_records", False)
+            boundary_head.setdefault("enable_relations", False)
+        migrated["boundary_head"] = validate_boundary_head(boundary_head)
     migrated.setdefault("config_version", ExtractorConfig.current_config_version)
     return migrated
 
@@ -285,7 +675,7 @@ class ExtractorConfig(PretrainedConfig):
     """Architecture-aware configuration for GLiNER2 extractors."""
 
     model_type = "extractor"
-    current_config_version = 2
+    current_config_version = 3
 
     def __init__(
         self,
@@ -294,6 +684,7 @@ class ExtractorConfig(PretrainedConfig):
         architecture_version: int = 1,
         token_pooling: str = "first",
         max_len: int = None,
+        attn_implementation: str = "sdpa",
         span_head: Mapping[str, Any] = None,
         boundary_head: Mapping[str, Any] = None,
         # Legacy span parameters
@@ -312,6 +703,14 @@ class ExtractorConfig(PretrainedConfig):
         self.model_name = model_name
         self.token_pooling = token_pooling
         self.max_len = max_len
+        # Transformers may serialize its reserved attention field as null;
+        # treat that as this extractor's documented default.
+        self.attn_implementation = str(attn_implementation or "sdpa")
+        if self.attn_implementation not in ("sdpa", "flash_attention_2", "eager"):
+            raise ValueError(
+                "attn_implementation must be 'sdpa', 'flash_attention_2', or "
+                f"'eager', got {self.attn_implementation!r}"
+            )
 
         if self.architecture == "span":
             span_values = dict(span_head or {})
@@ -323,7 +722,11 @@ class ExtractorConfig(PretrainedConfig):
             self.max_width = self.span_head["max_width"]
             self.counting_layer = counting_layer or "count_lstm"
         else:
-            self.boundary_head = validate_boundary_head(boundary_head or {})
+            boundary_values = dict(boundary_head or {})
+            if config_version is not None and config_version < 3:
+                boundary_values.setdefault("enable_records", False)
+                boundary_values.setdefault("enable_relations", False)
+            self.boundary_head = validate_boundary_head(boundary_values)
             if max_width is not None:
                 warnings.warn(
                     "max_width is ignored by the boundary architecture",

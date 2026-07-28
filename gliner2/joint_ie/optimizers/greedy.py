@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+from dataclasses import replace
 from typing import Hashable, List, Set
 
 from .base import BaseOptimizer, JointSolution
 from ..candidates import EdgeCandidate, JointProblem
+
+logger = logging.getLogger(__name__)
 
 
 class GreedyOptimizer(BaseOptimizer):
@@ -58,4 +62,13 @@ class GreedyOptimizer(BaseOptimizer):
             if self.allow_node(problem, node, current_nodes + [node], edges):
                 selected.add(node.candidate_id)
                 score += node.score
-        return self.solution(problem, selected, edges, score)
+        result = self.solution(problem, selected, edges, score)
+        # Derived companion edges added by ``solution`` are never screened during
+        # construction; verify the final assignment honors every hard constraint.
+        if self.validate_solution(problem, result):
+            return result
+        logger.warning(
+            "greedy joint-IE decoding produced a constraint-violating assignment; "
+            "returning empty solution",
+        )
+        return replace(self.solution(problem, frozenset(), (), 0.0), feasible=False)

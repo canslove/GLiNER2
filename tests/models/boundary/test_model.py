@@ -13,7 +13,9 @@ from tests.fixtures.tiny_boundary_checkpoint import build_tiny_boundary_model
 def test_boundary_model_builds_with_expected_modules():
     model = build_tiny_boundary_model()
     assert model.architecture == "boundary"
-    assert set(model.task_module_names()) == {"classifier", "boundary_head"}
+    assert set(model.task_module_names()) == {
+        "classifier", "boundary_head", "record_decoder", "relation_scorer"
+    }
     # Boundary head submodules exist; no span-specific span_rep/count modules.
     assert hasattr(model.boundary_head, "boundary_proposer")
     assert hasattr(model.boundary_head, "pair_scorer")

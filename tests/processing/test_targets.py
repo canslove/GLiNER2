@@ -134,6 +134,45 @@ def test_too_many_gold_pairs_raises_capacity_error():
                           max_gold_per_query=2)
 
 
+def test_capacity_policy_rejects_unknown_value():
+    graphs = [TargetGraph(mentions=(MentionTarget(0, 0, 1),))]
+    with pytest.raises(ValueError, match="on_capacity_exceeded"):
+        pad_target_graphs(graphs, query_counts=[1], text_lengths=[3],
+                          max_gold_per_query=2, on_capacity_exceeded="nope")
+
+
+def test_capacity_policy_truncate_with_warning(caplog):
+    graphs = [TargetGraph(mentions=(
+        MentionTarget(0, 0, 1), MentionTarget(0, 1, 2), MentionTarget(0, 2, 3),
+    ))]
+    with caplog.at_level("WARNING"):
+        padded = pad_target_graphs(
+            graphs, query_counts=[1], text_lengths=[3],
+            max_gold_per_query=2, on_capacity_exceeded="truncate_with_warning",
+        )
+    # Only max_gold_per_query kept; the rest are dropped with an explicit warning.
+    assert int(padded.mention_mask[0, 0].sum()) == 2
+    assert "truncated" in caplog.text
+
+
+def test_capacity_policy_skip_sample(caplog):
+    graphs = [
+        TargetGraph(mentions=(
+            MentionTarget(0, 0, 1), MentionTarget(0, 1, 2), MentionTarget(0, 2, 3),
+        )),
+        TargetGraph(mentions=(MentionTarget(0, 0, 2),)),
+    ]
+    with caplog.at_level("WARNING"):
+        padded = pad_target_graphs(
+            graphs, query_counts=[1, 1], text_lengths=[3, 3],
+            max_gold_per_query=2, on_capacity_exceeded="skip_sample",
+        )
+    # The overflowing sample contributes no gold; the second sample is intact.
+    assert int(padded.mention_mask[0].sum()) == 0
+    assert int(padded.mention_mask[1].sum()) == 1
+    assert "skipped" in caplog.text
+
+
 def test_duplicate_gold_pairs_are_collapsed():
     graphs = [TargetGraph(mentions=(
         MentionTarget(0, 0, 2), MentionTarget(0, 0, 2),  # duplicate

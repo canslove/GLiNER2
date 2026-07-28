@@ -267,51 +267,29 @@ class TestTrainingBatchCollation:
         would silently skip most samples yielding near-zero loss.
         """
         losses = {}
+        from gliner2.training.trainer import ExtractorCollator, ExtractorDataset
+
+        dataset = ExtractorDataset(TRAIN_EXAMPLES, validate=False)
+        device = next(model.parameters()).device
+        model.eval()
 
         for bs in [1, 4]:
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                config = TrainingConfig(
-                    output_dir=tmp_dir,
-                    batch_size=bs,
-                    num_epochs=1,
-                    eval_strategy="no",
-                    logging_steps=9999,
-                    fp16=False,
-                )
-
-                trainer = GLiNER2Trainer(model, config)
-                result = trainer.train(train_data=TRAIN_EXAMPLES)
-
-                # Collect final epoch loss from metrics history
-                history = result.get("train_metrics_history", [])
-                if history:
-                    losses[bs] = history[-1].loss
-                else:
-                    # Fall back: run a manual forward pass to get the loss
-                    from gliner2.training.trainer import (
-                        ExtractorCollator,
-                        ExtractorDataset,
-                    )
-                    dataset = ExtractorDataset(TRAIN_EXAMPLES, validate=False)
-                    collator = ExtractorCollator(
-                        model.processor,
-                        is_training=True,
-                        max_len=model.config.max_len,
-                    )
-                    loader = torch.utils.data.DataLoader(
-                        dataset, batch_size=bs, collate_fn=collator
-                    )
-                    device = next(model.parameters()).device
-                    model.train()
-                    total_loss = 0.0
-                    n_batches = 0
-                    for batch in loader:
-                        batch = batch.to(device)
-                        outputs = model(batch)
-                        total_loss += outputs["total_loss"].item()
-                        n_batches += 1
-                    losses[bs] = total_loss / max(n_batches, 1)
-                    model.eval()
+            collator = ExtractorCollator(
+                model.processor,
+                is_training=True,
+                max_len=model.config.max_len,
+            )
+            loader = torch.utils.data.DataLoader(
+                dataset, batch_size=bs, collate_fn=collator, shuffle=False
+            )
+            total_loss = 0.0
+            n_batches = 0
+            with torch.no_grad():
+                for batch in loader:
+                    outputs = model(batch.to(device))
+                    total_loss += outputs["total_loss"].item()
+                    n_batches += 1
+            losses[bs] = total_loss / max(n_batches, 1)
 
         loss_bs1 = losses[1]
         loss_bs4 = losses[4]

@@ -1,0 +1,15 @@
+{
+  "batch": 2,
+  "budget": 64,
+  "cuda_sync_count": 0,
+  "device": "cpu",
+  "dtype": "fp32",
+  "forward_backward_median_ms": 8.93700000597164,
+  "forward_median_ms": 2.3019585059955716,
+  "git_sha": "d9cfcaade1171d17e3a9b3932e05a24b4fd1db08",
+  "iters": 2,
+  "kernel_count": 150,
+  "length": 64,
+  "peak_memory_delta_bytes": 0,
+  "queries": 8
+}

@@ -13,13 +13,15 @@ This model accepts PreprocessedBatch directly for efficient GPU-only forward
 passes.
 """
 
-import importlib
 import logging
 import os
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Any, Optional, Tuple
+
+if TYPE_CHECKING:
+    from peft import PeftModel
 
 import torch
 import torch.nn as nn
@@ -31,22 +33,17 @@ from gliner2.processor import SchemaTransformer, PreprocessedBatch, SamplingConf
 from safetensors.torch import save_file, load_file
 from transformers import (
     PretrainedConfig,
-    PreTrainedModel,
-    AutoModel,
     AutoConfig,
     AutoTokenizer,
 )
 
-IS_FLASHDEBERTA = importlib.util.find_spec("flashdeberta") is not None
-if IS_FLASHDEBERTA:
-    from flashdeberta import FlashDebertaV2Model
-
 # ``ExtractorConfig`` lives in ``gliner2.configuration`` so both span and
 # boundary architectures share one validated config.
 from gliner2.configuration import ExtractorConfig
+from gliner2.models.base import BaseExtractorModel
 
 
-class SpanExtractorModel(PreTrainedModel):
+class SpanExtractorModel(BaseExtractorModel):
     """
     GLiNER2 Extractor Model.
 
@@ -88,7 +85,11 @@ class SpanExtractorModel(PreTrainedModel):
             )
 
         # Load encoder
-        self.encoder = self._load_encoder(config.model_name, encoder_config)
+        self.encoder = self._load_encoder(
+            config.model_name,
+            encoder_config,
+            getattr(config, "attn_implementation", "sdpa"),
+        )
 
         self.encoder.resize_token_embeddings(len(self.processor.tokenizer))
         self.hidden_size = self.encoder.config.hidden_size
@@ -148,40 +149,6 @@ class SpanExtractorModel(PreTrainedModel):
         print(f"Counting layer     : {config.counting_layer}")
         print(f"Token pooling      : {config.token_pooling}")
         print("=" * 60)
-
-    @staticmethod
-    def _load_encoder(model_name: str, encoder_config=None) -> nn.Module:
-        """Load the transformer encoder, using optimized backends when available.
-
-        Checks for FlashDeberta support when the encoder is DebertaV2-based.
-        Activated by setting the USE_FLASHDEBERTA environment variable.
-
-        Args:
-            model_name: Name or path of the pretrained model.
-            encoder_config: Optional pre-loaded encoder config. If provided,
-                the model is initialized from config; otherwise from pretrained.
-
-        Returns:
-            The initialized encoder module.
-        """
-        use_flashdeberta = (
-            IS_FLASHDEBERTA
-            and os.environ.get("USE_FLASHDEBERTA", "")
-        )
-
-        if encoder_config is not None:
-            config_name = encoder_config.__class__.__name__
-            if config_name == "DebertaV2Config" and use_flashdeberta:
-                print("Using FlashDeberta backend.")
-                return FlashDebertaV2Model(encoder_config)
-            return AutoModel.from_config(encoder_config, trust_remote_code=True)
-
-        pretrained_config = AutoConfig.from_pretrained(model_name)
-        config_name = pretrained_config.__class__.__name__
-        if config_name == "DebertaV2Config" and use_flashdeberta:
-            print("Using FlashDeberta backend.")
-            return FlashDebertaV2Model.from_pretrained(model_name)
-        return AutoModel.from_pretrained(model_name, trust_remote_code=True)
 
     # =========================================================================
     # Main Forward Pass
@@ -715,7 +682,7 @@ class SpanExtractorModel(PreTrainedModel):
             state_dict = load_file(model_path)
         except Exception:
             model_path = download_or_local(repo_or_dir, "pytorch_model.bin")
-            state_dict = torch.load(model_path, map_location="cpu")
+            state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
 
         # Handle embedding size mismatch
         try:
@@ -821,7 +788,7 @@ class SpanExtractorModel(PreTrainedModel):
         r: int = 8,
         alpha: float = 16.0,
         dropout: float = 0.0,
-        targets: list[str] | None = None,
+        targets: Optional[List[str]] = None,
         use_dora: bool = False,
     ) -> "PeftModel":
         """Apply LoRA adapters and return a PeftModel ready for training.

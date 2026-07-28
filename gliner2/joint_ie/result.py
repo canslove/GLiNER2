@@ -70,6 +70,9 @@ class JointResult:
     relations: List[JointRelation] = field(default_factory=list)
     default_include_confidence: bool = field(default=True, repr=False, compare=False)
     default_include_spans: bool = field(default=True, repr=False, compare=False)
+    # False when the decoder could not satisfy the declared hard constraints and
+    # fell back to an empty assignment (distinct from "nothing to extract").
+    feasible: bool = field(default=True, compare=False)
 
     def __post_init__(self) -> None:
         self.entities = list(self.entities)
@@ -218,7 +221,8 @@ class ResultBuilder:
             relations.append(JointRelation(label, head, tail,
                 _geometric_mean(scores) if confidence_flag else None, derived))
         relations.sort(key=lambda rel: (rel.type, rel.head, rel.tail))
-        return JointResult(document, entities, relations, confidence_flag, spans_flag)
+        feasible = bool(_get(solution, "feasible", default=True))
+        return JointResult(document, entities, relations, confidence_flag, spans_flag, feasible)
 
     __call__ = build
 

@@ -20,7 +20,7 @@ from gliner2.processing.records import FieldCardinality, RecordFieldSpec, Record
 from gliner2.processing.targets import RecordFieldTarget, RecordTarget, TargetCapacityError
 
 
-def _build_tiny_records_model():
+def _build_tiny_records_model(candidate_pool="per_query"):
     from gliner2 import ExtractorConfig
     from gliner2.inference.engine import BoundaryExtractor
     from tests.fixtures.tiny_boundary_checkpoint import TINY_BOUNDARY_HEAD
@@ -30,7 +30,12 @@ def _build_tiny_records_model():
     tokenizer = build_tiny_tokenizer()
     encoder_config = build_tiny_encoder_config(vocab_size=len(tokenizer))
     head = dict(TINY_BOUNDARY_HEAD)
-    head.update(enable_records=True, record_dim=24, record_instance_queries=8)
+    head.update(
+        enable_records=True,
+        record_dim=24,
+        record_instance_queries=8,
+        candidate_pool=candidate_pool,
+    )
     config = ExtractorConfig(
         model_name="tiny-bert-fixture",
         architecture="boundary",
@@ -92,6 +97,8 @@ def test_records_training_loss_flows_through_model():
         "record_metadata": {"purchase": {"mode": "natural", "anchor": "buyer"}},
     }
     batch = collator([("Alice bought apples and Bob sold oranges", output_dict)])
+    assert isinstance(batch.targets.record_targets, tuple)
+    assert len(batch.targets.record_targets) == 9
     if batch.query_layouts[0].extractive_count() == 0:
         pytest.skip("tiny tokenizer produced no extractive queries for the structure")
 
@@ -101,6 +108,52 @@ def test_records_training_loss_flows_through_model():
     out.total_loss.backward()
     grads = [p.grad for p in model.record_decoder.parameters() if p.grad is not None]
     assert grads, "no gradient reached the record head"
+
+
+def test_shared_records_use_fully_batched_training_path(monkeypatch):
+    from gliner2.processor import SamplingConfig, SchemaTransformer
+    from gliner2.training import ExtractorCollator
+    from tests.fixtures.tiny_tokenizer import build_tiny_tokenizer
+
+    model = _build_tiny_records_model(candidate_pool="shared")
+    model.train()
+    monkeypatch.setattr(
+        model.record_decoder,
+        "forward_group_dense",
+        lambda *args, **kwargs: pytest.fail("per-group shared path was used"),
+    )
+    processor = SchemaTransformer(
+        tokenizer=build_tiny_tokenizer(),
+        sampling_config=SamplingConfig(
+            remove_json_structure_prob=0.0,
+            shuffle_json_fields=False,
+            remove_json_field_prob=0.0,
+            synthetic_entity_label_prob=0.0,
+        ),
+    )
+    batch = ExtractorCollator(
+        processor,
+        is_training=True,
+        architecture="boundary",
+        max_gold_per_query=16,
+    )([(
+        "Alice bought apples",
+        {
+            "json_structures": [
+                {"purchase": {"buyer": "Alice", "item": "apples"}}
+            ],
+            "record_metadata": {
+                "purchase": {"mode": "natural", "anchor": "buyer"}
+            },
+        },
+    )])
+    output = model(batch)
+    assert torch.isfinite(output.loss)
+    output.loss.backward()
+    assert any(
+        parameter.grad is not None
+        for parameter in model.record_decoder.parameters()
+    )
 
 
 def test_engine_decode_records_emits_public_structure_shape():
@@ -267,6 +320,78 @@ def test_latent_mode_recovers_grouped_records():
     }
     assert ((( 0, 1),), ((1, 2),)) in got
     assert (((2, 3),), ((3, 4),)) in got
+
+
+def test_score_candidates_returns_auxiliary_logits_when_requested():
+    from gliner2.processor import SamplingConfig, SchemaTransformer
+    from gliner2.training import ExtractorCollator
+    from tests.fixtures.tiny_tokenizer import build_tiny_tokenizer
+
+    model = _build_tiny_records_model()
+    proc = SchemaTransformer(
+        tokenizer=build_tiny_tokenizer(),
+        sampling_config=SamplingConfig(
+            remove_json_structure_prob=0.0, shuffle_json_fields=False,
+            remove_json_field_prob=0.0, synthetic_entity_label_prob=0.0,
+        ),
+    )
+    collator = ExtractorCollator(
+        proc, is_training=True, architecture="boundary", max_gold_per_query=16
+    )
+    output_dict = {
+        "json_structures": [{"purchase": {"buyer": "Alice", "item": "apples"}}],
+        "record_metadata": {"purchase": {"mode": "natural", "anchor": "buyer"}},
+    }
+    batch = collator([("Alice bought apples", output_dict)])
+
+    plain = model.score_candidates(batch)
+    result = model.score_candidates(batch, return_auxiliary_logits=True)
+
+    # Default contract unchanged: a bare CandidateTensorBatch.
+    assert not isinstance(plain, tuple)
+    # Requested contract: (candidates, aux) with the backing boundary marginals.
+    assert isinstance(result, tuple) and len(result) == 2
+    candidates, aux = result
+    assert torch.equal(plain.indices, candidates.indices)
+    assert set(aux) == {"start_logits", "end_logits", "inside_logits"}
+    for key in ("start_logits", "end_logits"):
+        assert aux[key] is not None
+        assert aux[key].dim() == 3 and aux[key].shape[0] == len(batch)
+
+
+def test_matched_record_loss_keeps_gradients_despite_nograd_cost():
+    """The Hungarian cost is built under ``no_grad`` but matched object/field
+    losses must still backpropagate into the head parameters."""
+    torch.manual_seed(11)
+    hidden = 24
+    cands = make_candidates([[(0, 1), (2, 3), (4, 5)], [(1, 2), (3, 4), (5, 6)]], hidden)
+    spec = RecordSpec(
+        task_index=0, task_name="deal", task_type="json_structures", mode="latent",
+        fields=(
+            RecordFieldSpec(0, "a", 0, FieldCardinality.OPTIONAL_ONE),
+            RecordFieldSpec(1, "b", 1, FieldCardinality.OPTIONAL_ONE),
+        ),
+    )
+    query_states = torch.randn(2, hidden)
+    records = [
+        RecordTarget("0:0", 0, (
+            RecordFieldTarget(0, (((0, 1),),)),
+            RecordFieldTarget(1, (((1, 2),),)),
+        )),
+        RecordTarget("0:1", 0, (
+            RecordFieldTarget(0, (((2, 3),),)),
+            RecordFieldTarget(1, (((3, 4),),)),
+        )),
+    ]
+    head = RecordHead(hidden, record_dim=24, instance_queries=8)
+    group = head.forward_group(spec, query_states, cands, 0)
+    losses = compute_group_loss(group, records)
+    total = losses["object_loss"] + losses["field_loss"]
+    assert total.requires_grad
+    total.backward()
+    grads = [p.grad for p in head.parameters() if p.grad is not None]
+    assert grads, "matched record loss must produce gradients on head parameters"
+    assert all(torch.isfinite(g).all() for g in grads)
 
 
 def test_anchorless_capacity_error_when_gold_exceeds_queries():

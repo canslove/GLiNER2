@@ -145,6 +145,8 @@ def test_boundary_model_wires_sparse_relation_loss():
         "Alice works for Acme",
         {"relations": [{"works_for": {"head": "Alice", "tail": "Acme"}}]},
     )])
+    assert isinstance(batch.targets.edge_targets, tuple)
+    assert len(batch.targets.edge_targets) == 6
     model.train()
     output = model(batch)
     assert "relation_scorer" in model.task_module_names()

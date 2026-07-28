@@ -89,6 +89,58 @@ class ResidualSwiGLU(nn.Module):
         return states + self.dropout(update)
 
 
+class BoundaryAttentionBlock(nn.Module):
+    """Pre-norm self-attention over valid boundary positions."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 4,
+        window: int = 0,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if dim % num_heads:
+            raise ValueError(f"dim {dim} must be divisible by num_heads {num_heads}")
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.window = window
+        self.norm = nn.LayerNorm(dim)
+        self.qkv_projection = nn.Linear(dim, 3 * dim)
+        self.output_projection = nn.Linear(dim, dim)
+        self.dropout_p = dropout
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self, states: torch.Tensor, mask: torch.BoolTensor
+    ) -> torch.Tensor:
+        b, n, d = states.shape
+        qkv = self.qkv_projection(self.norm(states)).view(
+            b, n, 3, self.num_heads, self.head_dim
+        )
+        query, key, value = qkv.permute(2, 0, 3, 1, 4)
+        allowed = mask.view(b, 1, 1, n).expand(b, 1, n, n)
+        if self.window > 0:
+            positions = torch.arange(n, device=states.device)
+            local = (
+                positions.view(n, 1) - positions.view(1, n)
+            ).abs() <= self.window
+            allowed = allowed & local.view(1, 1, n, n)
+        # Padding query rows still need one legal key to avoid NaNs.
+        diagonal = torch.eye(n, dtype=torch.bool, device=states.device)
+        allowed = allowed | diagonal.view(1, 1, n, n)
+        attended = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=allowed,
+            dropout_p=self.dropout_p if self.training else 0.0,
+        )
+        attended = attended.transpose(1, 2).reshape(b, n, d)
+        update = self.dropout(self.output_projection(attended))
+        return (states + update) * mask.unsqueeze(-1).to(states.dtype)
+
+
 class BoundaryEncoder(nn.Module):
     """Projects and refines left/right token states into per-boundary states."""
 
@@ -99,6 +151,9 @@ class BoundaryEncoder(nn.Module):
         dropout: float = 0.1,
         refinement_layers: int = 1,
         ffn_multiplier: float = 2.0,
+        attention_layers: int = 0,
+        attention_heads: int = 4,
+        attention_window: int = 0,
     ):
         super().__init__()
         if refinement_layers < 0:
@@ -112,6 +167,12 @@ class BoundaryEncoder(nn.Module):
         self.output_projection = nn.Linear(2 * boundary_dim, boundary_dim)
         self.layer_norm = nn.LayerNorm(boundary_dim)
         self.dropout = nn.Dropout(dropout)
+        self.attention_blocks = nn.ModuleList(
+            BoundaryAttentionBlock(
+                boundary_dim, attention_heads, attention_window, dropout
+            )
+            for _ in range(attention_layers)
+        )
         self.refinement_blocks = nn.ModuleList(
             ResidualSwiGLU(boundary_dim, ffn_multiplier, dropout)
             for _ in range(refinement_layers)
@@ -133,10 +194,12 @@ class BoundaryEncoder(nn.Module):
         states = self.output_projection(torch.cat([left_p, right_p], dim=-1))
         states = self.layer_norm(states)
         states = self.dropout(states)
+        mask = build_boundary_mask(text_lengths, l)  # [B, L+1]
+        for block in self.attention_blocks:
+            states = block(states, mask)
         for block in self.refinement_blocks:
             states = block(states)
 
-        mask = build_boundary_mask(text_lengths, l)  # [B, L+1]
         # Zero out padding boundary states so they cannot leak into downstream
         # gathers/scores through numerical noise.
         states = states * mask.unsqueeze(-1).to(states.dtype)

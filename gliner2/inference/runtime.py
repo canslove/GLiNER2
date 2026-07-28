@@ -17,10 +17,13 @@ span-rep candidate path implemented here; the boundary model overrides
 
 from __future__ import annotations
 
+import logging
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Union, Tuple, TYPE_CHECKING
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 from gliner2.inference.schema import (
     AttributeGroup, RegexValidator, StructureBuilder, Schema
@@ -28,7 +31,7 @@ from gliner2.inference.schema import (
 from gliner2.processor import PreprocessedBatch
 from gliner2.inference.chunking import merge_chunk_results, split_text_into_chunks
 from gliner2.training.trainer import ExtractorCollator
-from gliner2.inference.span_decoder import finalize_spans
+from gliner2.inference.candidate_decoder import finalize_spans
 
 if TYPE_CHECKING:
     from gliner2.api_client import GLiNER2API
@@ -38,6 +41,12 @@ class ExtractorRuntimeMixin:
     """Shared public extraction API for span and boundary architectures."""
 
     _ENTITY_RESULT_KEYS = frozenset({"text", "confidence", "start", "end"})
+
+    # When True (default), a per-sample extraction failure propagates instead of
+    # being swallowed into an empty result. Batch jobs can set this to False to
+    # opt into resilient extraction, where failures are logged and the offending
+    # sample yields ``{}``.
+    strict_extraction: bool = True
 
     @classmethod
     def from_api(cls, api_key: str = None, api_base_url: str = None,
@@ -67,6 +76,7 @@ class ExtractorRuntimeMixin:
         include_confidence: bool = False,
         include_spans: bool = False,
         max_len: Optional[int] = None,
+        overlap_policy: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Extract from multiple texts with parallel preprocessing."""
         if not texts:
@@ -83,6 +93,9 @@ class ExtractorRuntimeMixin:
             schema_list = [schemas] * len(texts)
 
         schema_dicts, metadata_list = self._build_schema_dicts_and_metadata(schema_list)
+        if overlap_policy is not None:
+            for metadata in metadata_list:
+                metadata["_overlap_policy"] = overlap_policy
 
         dataset = list(zip(texts, schema_dicts))
 
@@ -246,8 +259,10 @@ class ExtractorRuntimeMixin:
                     span_info=all_span_info[i],
                 )
                 results.append(sample_result)
-            except Exception as e:
-                print(f"Error extracting sample {i}: {e}")
+            except Exception:
+                logger.exception("extraction failed for sample %d", i)
+                if getattr(self, "strict_extraction", True):
+                    raise
                 results.append({})
 
         return results
@@ -335,7 +350,8 @@ class ExtractorRuntimeMixin:
         schema_name: str,
         schema: Dict,
         embs: torch.Tensor,
-        schema_tokens: List[str]
+        schema_tokens: List[str],
+        temperature: float = 1.0,
     ):
         """Extract classification result."""
         prompt_str = schema_tokens[2]
@@ -345,7 +361,9 @@ class ExtractorRuntimeMixin:
         schema_name = cls_config["task"]
 
         cls_embeds = embs[1:]
-        logits = self.classifier(cls_embeds).squeeze(-1)
+        if temperature <= 0:
+            raise ValueError("classification temperature must be > 0")
+        logits = self.classifier(cls_embeds).squeeze(-1) / temperature
 
         activation = cls_config.get("class_act", "auto")
         is_multi = cls_config.get("multi_label", False)
@@ -887,7 +905,7 @@ class ExtractorRuntimeMixin:
         if already_finalized:
             selected = spans
         else:
-                selected = finalize_spans(spans)
+            selected = finalize_spans(spans)
 
         if include_spans and include_confidence:
             return [{"text": s[0], "confidence": s[1], "start": s[2], "end": s[3]} for s in selected]
@@ -1061,11 +1079,13 @@ class ExtractorRuntimeMixin:
 
     def extract(self, text: str, schema, threshold: float = 0.5,
                 format_results: bool = True, include_confidence: bool = False,
-                include_spans: bool = False, max_len: Optional[int] = None) -> Dict:
+                include_spans: bool = False, max_len: Optional[int] = None,
+                overlap_policy: Optional[str] = None) -> Dict:
         """Extract from single text."""
         return self.batch_extract(
             [text], schema, 1, threshold, 0, format_results,
             include_confidence, include_spans, max_len=max_len,
+            overlap_policy=overlap_policy,
         )[0]
 
     def extract_long(
@@ -1080,6 +1100,7 @@ class ExtractorRuntimeMixin:
         format_results: bool = True,
         include_confidence: bool = False,
         include_spans: bool = False,
+        overlap_policy: Optional[str] = None,
     ) -> Dict:
         """Extract from a long document with overlapping word chunks."""
         return self.batch_extract_long(
@@ -1091,6 +1112,7 @@ class ExtractorRuntimeMixin:
             format_results=format_results,
             include_confidence=include_confidence,
             include_spans=include_spans,
+            overlap_policy=overlap_policy,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
         )[0]
@@ -1107,6 +1129,7 @@ class ExtractorRuntimeMixin:
         include_spans: bool = False,
         chunk_size: int = 384,
         chunk_overlap: int = 64,
+        overlap_policy: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Extract from long documents by scanning overlapping word chunks."""
         if not format_results:
@@ -1144,6 +1167,7 @@ class ExtractorRuntimeMixin:
             include_confidence=True,
             include_spans=True,
             max_len=chunk_size,
+            overlap_policy=overlap_policy,
         )
 
         merged_results: List[Dict[str, Any]] = []
@@ -1212,6 +1236,7 @@ class ExtractorRuntimeMixin:
             format_results=format_results,
             include_confidence=include_confidence,
             include_spans=include_spans,
+            overlap_policy=overlap_policy,
         )
 
     def batch_extract_entities(self, texts: List[str], entity_types, batch_size: int = 8,

@@ -62,3 +62,15 @@ def test_extractor_output_mapping_access():
     assert "pair_loss" in out
     assert "nonexistent" not in out
     assert out.get("nonexistent", 123) == 123
+
+
+def test_extractor_output_declared_but_none_field_is_absent():
+    # A declared field left as None must behave as absent: `.get` returns the
+    # default, `in` is False, and `__getitem__` raises (consistent semantics).
+    out = ExtractorOutput(batch_size=1)
+    assert out.total_loss is None
+    assert "total_loss" not in out
+    sentinel = object()
+    assert out.get("total_loss", sentinel) is sentinel
+    with pytest.raises(KeyError):
+        _ = out["total_loss"]

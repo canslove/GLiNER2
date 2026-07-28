@@ -1,6 +1,10 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+**/__pycache__/
 *.py[cod]
+*.pyc
+*.pyo
+*.pyd
 *$py.class
 
 # C extensions
@@ -90,6 +94,7 @@ Thumbs.db
 *.bin
 *.onnx
 *.safetensors
+!/tests/models/boundary/_golden/*.safetensors
 
 # Logs
 *.log
@@ -97,4 +102,7 @@ Thumbs.db
 test_api_client.py
 /docs/boundary_architecture.md
 /benchmarks/
-/scripts/
+/scripts/*
+!/scripts/check_public_surface.py
+!/scripts/surface_snapshot.py
+!/scripts/preflight_gold_capacity.py

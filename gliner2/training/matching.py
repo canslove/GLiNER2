@@ -12,6 +12,9 @@ from dataclasses import dataclass
 from typing import List, Sequence, Tuple
 
 import torch
+import torch.nn.functional as F
+
+from gliner2.models.boundary.constants import MASK_LOGIT
 
 _INF = float("inf")
 
@@ -42,6 +45,23 @@ def linear_sum_assignment(cost_matrix: torch.Tensor) -> Tuple[torch.LongTensor, 
     if r == 0 or c == 0:
         empty = torch.zeros(0, dtype=torch.long)
         return empty, empty
+    try:
+        from scipy.optimize import linear_sum_assignment as scipy_assignment
+    except ImportError:
+        scipy_assignment = None
+    if scipy_assignment is not None:
+        # SciPy's compiled solver avoids the Python O(n^2 m) hot loop. Add a
+        # sub-ULP lexicographic offset so exact ties resolve reproducibly.
+        array = cost.numpy()
+        scale = max(float(abs(array).max()), 1.0)
+        epsilon = torch.finfo(torch.float64).eps * scale
+        tie = torch.arange(r * c, dtype=torch.float64).reshape(r, c).numpy()
+        rows, cols = scipy_assignment(array + epsilon * tie)
+        pairs = sorted(zip(rows.tolist(), cols.tolist()))
+        return (
+            torch.tensor([row for row, _ in pairs], dtype=torch.long),
+            torch.tensor([col for _, col in pairs], dtype=torch.long),
+        )
 
     transposed = c < r
     if transposed:
@@ -156,9 +176,56 @@ def match_record_instances(
     return MatchingResult(row_ind=row_ind, col_ind=col_ind, cost=total)
 
 
+def build_dense_record_matching_cost(
+    object_logits: torch.Tensor,       # [...,I]
+    assign_logits: torch.Tensor,       # [...,I,F,1+C]
+    gold_indicator: torch.BoolTensor,  # [...,N,F,C]
+    scalar_fields: torch.BoolTensor,   # [...,F] or [F]
+    instance_mask: torch.BoolTensor | None = None,  # [...,I]
+) -> torch.Tensor:
+    """Vectorized record cost ``[...,I,N]`` for dense document pools."""
+    present = gold_indicator.any(-1)
+    target = torch.cat(((~present).unsqueeze(-1), gold_indicator), -1)
+    logp = F.log_softmax(assign_logits, -1)
+    scalar_logprob = torch.logsumexp(
+        logp.unsqueeze(-3).masked_fill(
+            ~target.unsqueeze(-4), MASK_LOGIT
+        ),
+        -1,
+    )
+    candidates = assign_logits[..., 1:]
+    list_logprob = -F.binary_cross_entropy_with_logits(
+        candidates.unsqueeze(-3).expand(
+            *candidates.shape[:-3],
+            candidates.shape[-3],
+            gold_indicator.shape[-3],
+            candidates.shape[-2],
+            candidates.shape[-1],
+        ),
+        gold_indicator.unsqueeze(-4).expand(
+            *gold_indicator.shape[:-3],
+            assign_logits.shape[-3],
+            gold_indicator.shape[-3],
+            gold_indicator.shape[-2],
+            gold_indicator.shape[-1],
+        ).to(candidates.dtype),
+        reduction="none",
+    ).sum(-1)
+    field_logprob = torch.where(
+        scalar_fields.unsqueeze(-2).unsqueeze(-2),
+        scalar_logprob,
+        list_logprob,
+    ).sum(-1)
+    cost = -(F.logsigmoid(object_logits).unsqueeze(-1) + field_logprob)
+    if instance_mask is not None:
+        cost = cost.masked_fill(~instance_mask.unsqueeze(-1), -MASK_LOGIT)
+    return cost
+
+
 __all__ = [
     "linear_sum_assignment",
     "MatchingResult",
     "build_record_matching_cost",
     "match_record_instances",
+    "build_dense_record_matching_cost",
 ]

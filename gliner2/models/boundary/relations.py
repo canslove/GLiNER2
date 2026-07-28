@@ -14,6 +14,7 @@ from typing import List, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from gliner2.models.base import QueryLayout
 from gliner2.models.outputs import CandidateTensorBatch
@@ -24,6 +25,7 @@ class RelationProposalSettings:
     heads_per_relation: int = 32
     tails_per_relation: int = 32
     pair_cap: int = 128
+    argument_threshold: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,7 @@ class RelationPairBatch:
     tail_end: torch.LongTensor
     head_prob: torch.Tensor
     tail_prob: torch.Tensor
+    pair_mask: torch.BoolTensor | None = None
     head_keys: List[Tuple[str, int, int]] = field(default_factory=list)
     tail_keys: List[Tuple[str, int, int]] = field(default_factory=list)
     relation_types: List[str] = field(default_factory=list)
@@ -67,30 +70,6 @@ def _query_type(layout: QueryLayout, query_id: int) -> str:
         return str(query_id)
 
 
-def _top_mentions(
-    candidates: CandidateTensorBatch,
-    b: int,
-    query_ids: Sequence[int],
-    top_k: int,
-) -> List[Tuple[float, int, int, int]]:
-    """Return up to ``top_k`` (prob, start, end, query_id) for the given queries."""
-    scored: List[Tuple[float, int, int, int]] = []
-    probs = torch.sigmoid(candidates.pair_logits)
-    c = candidates.indices.shape[2]
-    for qid in query_ids:
-        if qid >= candidates.query_mask.shape[1] or not bool(candidates.query_mask[b, qid]):
-            continue
-        for ci in range(c):
-            if not bool(candidates.valid_mask[b, qid, ci]):
-                continue
-            p = float(probs[b, qid, ci].detach())
-            s = int(candidates.indices[b, qid, ci, 0])
-            e = int(candidates.indices[b, qid, ci, 1])
-            scored.append((p, s, e, qid))
-    scored.sort(key=lambda t: (-t[0], t[1], t[2]))
-    return scored[:top_k]
-
-
 class TypedRelationPairGenerator:
     """Generate typed, capped relation pairs from entity candidates."""
 
@@ -102,54 +81,208 @@ class TypedRelationPairGenerator:
         candidates: CandidateTensorBatch,
         query_layouts: Sequence[QueryLayout],
         relation_schema: Sequence[RelationTypeSpec],
+        *,
+        compact: bool = True,
     ) -> RelationPairBatch:
-        s = self.settings
-        bi: List[int] = []
-        ri: List[int] = []
-        hs: List[int] = []
-        he: List[int] = []
-        ts: List[int] = []
-        te: List[int] = []
-        hp: List[float] = []
-        tp: List[float] = []
-        hkeys: List[Tuple[str, int, int]] = []
-        tkeys: List[Tuple[str, int, int]] = []
-        rtypes: List[str] = []
-
-        batch_size = candidates.indices.shape[0]
-        for b in range(batch_size):
-            layout = query_layouts[b] if b < len(query_layouts) else None
-            for r_index, spec in enumerate(relation_schema):
-                heads = _top_mentions(candidates, b, spec.head_query_ids, s.heads_per_relation)
-                tails = _top_mentions(candidates, b, spec.tail_query_ids, s.tails_per_relation)
-                pairs: List[Tuple[float, tuple, tuple]] = []
-                for (hprob, h0, h1, hq) in heads:
-                    for (tprob, t0, t1, tq) in tails:
-                        if not spec.allow_self and (h0, h1) == (t0, t1):
-                            continue
-                        pairs.append((hprob * tprob, (hprob, h0, h1, hq), (tprob, t0, t1, tq)))
-                pairs.sort(key=lambda t: -t[0])
-                for _, (hprob, h0, h1, hq), (tprob, t0, t1, tq) in pairs[: s.pair_cap]:
-                    bi.append(b)
-                    ri.append(r_index)
-                    hs.append(h0); he.append(h1); ts.append(t0); te.append(t1)
-                    hp.append(hprob); tp.append(tprob)
-                    htype = _query_type(layout, hq) if layout is not None else str(hq)
-                    ttype = _query_type(layout, tq) if layout is not None else str(tq)
-                    hkeys.append((htype, h0, h1))
-                    tkeys.append((ttype, t0, t1))
-                    rtypes.append(spec.relation_type)
-
-        device = candidates.indices.device
-        long = lambda xs: torch.tensor(xs, dtype=torch.long, device=device)
-        flt = lambda xs: torch.tensor(xs, dtype=torch.float, device=device)
-        return RelationPairBatch(
-            batch_index=long(bi), relation_index=long(ri),
-            head_start=long(hs), head_end=long(he),
-            tail_start=long(ts), tail_end=long(te),
-            head_prob=flt(hp), tail_prob=flt(tp),
-            head_keys=hkeys, tail_keys=tkeys, relation_types=rtypes,
+        schemas = [relation_schema for _ in range(candidates.indices.shape[0])]
+        return self.generate_batched(
+            candidates, query_layouts, schemas, compact=compact
         )
+
+    def generate_batched(
+        self,
+        candidates: CandidateTensorBatch,
+        query_layouts: Sequence[QueryLayout],
+        relation_schemas: Sequence[Sequence[RelationTypeSpec]],
+        *,
+        compact: bool = False,
+        routing: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        | None = None,
+    ) -> RelationPairBatch:
+        """Generate all ``[B,R,pair_cap]`` proposals with tensor operations.
+
+        ``compact=False`` is the synchronization-free training representation:
+        invalid padded proposals remain present and are identified by
+        :attr:`RelationPairBatch.pair_mask`. ``compact=True`` is the
+        backward-compatible decode representation and materializes Python keys.
+        """
+        s = self.settings
+        device = candidates.indices.device
+        bsz, queries, cand_count = candidates.valid_mask.shape
+        rel_count = (
+            routing[0].shape[1]
+            if routing is not None
+            else max((len(x) for x in relation_schemas), default=0)
+        )
+        if rel_count == 0:
+            empty = torch.zeros(0, dtype=torch.long, device=device)
+            return RelationPairBatch(
+                empty, empty, empty, empty, empty, empty,
+                candidates.pair_logits.new_zeros(0),
+                candidates.pair_logits.new_zeros(0),
+                pair_mask=torch.zeros(0, dtype=torch.bool, device=device),
+            )
+
+        if routing is not None:
+            head_member, tail_member, relation_valid, allow_self = routing
+            head_member = head_member.to(device=device)
+            tail_member = tail_member.to(device=device)
+            relation_valid = relation_valid.to(device=device)
+            allow_self = allow_self.to(device=device)
+        else:
+            # Decode-only fallback. Training supplies collator-built routing and
+            # never performs device scalar writes in this loop.
+            head_member = torch.zeros(
+                bsz, rel_count, queries, dtype=torch.bool, device=device
+            )
+            tail_member = torch.zeros_like(head_member)
+            relation_valid = torch.zeros(
+                bsz, rel_count, dtype=torch.bool, device=device
+            )
+            allow_self = torch.zeros_like(relation_valid)
+            for batch_index, schemas in enumerate(relation_schemas):
+                for relation_index, spec in enumerate(schemas):
+                    relation_valid[batch_index, relation_index] = True
+                    allow_self[batch_index, relation_index] = spec.allow_self
+                    valid_h = [q for q in spec.head_query_ids if 0 <= q < queries]
+                    valid_t = [q for q in spec.tail_query_ids if 0 <= q < queries]
+                    if valid_h:
+                        head_member[batch_index, relation_index, valid_h] = True
+                    if valid_t:
+                        tail_member[batch_index, relation_index, valid_t] = True
+
+        probs = torch.sigmoid(candidates.pair_logits)
+        base_valid = candidates.valid_mask & candidates.query_mask.unsqueeze(-1)
+        flat_prob = probs.reshape(bsz, 1, queries * cand_count).expand(-1, rel_count, -1)
+        flat_valid = base_valid.reshape(bsz, 1, -1).expand(-1, rel_count, -1)
+        head_valid = flat_valid & head_member.unsqueeze(-1).expand(
+            -1, -1, -1, cand_count
+        ).reshape(bsz, rel_count, -1)
+        tail_valid = flat_valid & tail_member.unsqueeze(-1).expand(
+            -1, -1, -1, cand_count
+        ).reshape(bsz, rel_count, -1)
+        threshold = flat_prob >= s.argument_threshold
+        head_valid &= threshold
+        tail_valid &= threshold
+        floor = torch.finfo(flat_prob.dtype).min
+        flat_spans = candidates.indices.reshape(bsz, queries * cand_count, 2)
+
+        def select(valid: torch.BoolTensor, requested: int):
+            take = min(requested, queries * cand_count)
+            secondary = torch.arange(
+                queries * cand_count, device=device
+            ).view(1, 1, -1).expand(bsz, rel_count, -1)
+            end_key = flat_spans[..., 1].unsqueeze(1).expand(
+                -1, rel_count, -1
+            )
+            end_order = torch.argsort(
+                end_key.gather(-1, secondary), dim=-1, stable=True
+            )
+            secondary = secondary.gather(-1, end_order)
+            start_key = flat_spans[..., 0].unsqueeze(1).expand(
+                -1, rel_count, -1
+            )
+            start_order = torch.argsort(
+                start_key.gather(-1, secondary), dim=-1, stable=True
+            )
+            secondary = secondary.gather(-1, start_order)
+            ordered_score = flat_prob.gather(-1, secondary)
+            ordered_valid = valid.gather(-1, secondary)
+            rank_in_secondary = torch.argsort(
+                ordered_score.masked_fill(~ordered_valid, floor),
+                dim=-1, descending=True, stable=True,
+            )[..., :take]
+            ranked = secondary.gather(-1, rank_in_secondary)
+            selected_valid = valid.gather(-1, ranked)
+            selected_prob = flat_prob.gather(-1, ranked)
+            if take < requested:
+                pad = requested - take
+                ranked = F.pad(ranked, (0, pad))
+                selected_valid = F.pad(selected_valid, (0, pad), value=False)
+                selected_prob = F.pad(selected_prob, (0, pad))
+            qslot = torch.div(ranked, cand_count, rounding_mode="floor")
+            cslot = ranked - qslot * cand_count
+            batch = torch.arange(bsz, device=device)[:, None, None]
+            spans = candidates.indices[batch, qslot, cslot]
+            return selected_prob, qslot, spans, selected_valid
+
+        hp, hq, hspan, hvalid = select(head_valid, s.heads_per_relation)
+        tp, tq, tspan, tvalid = select(tail_valid, s.tails_per_relation)
+        pair_score = hp.unsqueeze(-1) * tp.unsqueeze(-2)
+        pair_valid = hvalid.unsqueeze(-1) & tvalid.unsqueeze(-2)
+        same_span = (hspan.unsqueeze(-2) == tspan.unsqueeze(-3)).all(-1)
+        pair_valid &= allow_self[..., None, None] | ~same_span
+        pair_valid &= relation_valid[..., None, None]
+        flat_pair_score = pair_score.flatten(2)
+        flat_pair_valid = pair_valid.flatten(2)
+        take = min(s.pair_cap, flat_pair_score.shape[-1])
+        keep = torch.argsort(
+            flat_pair_score.masked_fill(~flat_pair_valid, floor),
+            dim=-1, descending=True, stable=True,
+        )[..., :take]
+        kept_valid = flat_pair_valid.gather(-1, keep)
+        if take < s.pair_cap:
+            keep = F.pad(keep, (0, s.pair_cap - take))
+            kept_valid = F.pad(kept_valid, (0, s.pair_cap - take), value=False)
+        hi = torch.div(keep, s.tails_per_relation, rounding_mode="floor")
+        ti = keep - hi * s.tails_per_relation
+
+        def gather_selected(values: torch.Tensor, index: torch.LongTensor):
+            return values.gather(
+                2, index.unsqueeze(-1).expand(*index.shape, values.shape[-1])
+            )
+
+        hs = gather_selected(hspan, hi)
+        ts = gather_selected(tspan, ti)
+        hp_out = hp.gather(2, hi)
+        tp_out = tp.gather(2, ti)
+        hq_out = hq.gather(2, hi)
+        tq_out = tq.gather(2, ti)
+        bi = torch.arange(bsz, device=device)[:, None, None].expand_as(keep)
+        ri = torch.arange(rel_count, device=device)[None, :, None].expand_as(keep)
+
+        flat_mask = kept_valid.reshape(-1)
+        tensors = [
+            bi.reshape(-1), ri.reshape(-1), hs[..., 0].reshape(-1),
+            hs[..., 1].reshape(-1), ts[..., 0].reshape(-1),
+            ts[..., 1].reshape(-1), hp_out.reshape(-1), tp_out.reshape(-1),
+            hq_out.reshape(-1), tq_out.reshape(-1),
+        ]
+        if compact:
+            tensors = [value[flat_mask] for value in tensors]
+            flat_mask = torch.ones_like(tensors[0], dtype=torch.bool)
+        out = RelationPairBatch(
+            batch_index=tensors[0], relation_index=tensors[1],
+            head_start=tensors[2], head_end=tensors[3],
+            tail_start=tensors[4], tail_end=tensors[5],
+            head_prob=tensors[6], tail_prob=tensors[7],
+            pair_mask=flat_mask,
+        )
+        if compact:
+            # Decode-only metadata: Python conversion is intentionally absent
+            # from the training representation.
+            for index in range(len(out)):
+                batch_index = int(out.batch_index[index])
+                relation_index = int(out.relation_index[index])
+                spec = relation_schemas[batch_index][relation_index]
+                layout = (
+                    query_layouts[batch_index]
+                    if batch_index < len(query_layouts) else None
+                )
+                out.relation_types.append(spec.relation_type)
+                # Endpoint type names are only presentation metadata. For the
+                # common single-type schema use the declared query directly.
+                hquery = int(tensors[8][index])
+                tquery = int(tensors[9][index])
+                out.head_keys.append((
+                    _query_type(layout, hquery) if layout is not None else str(hquery),
+                    int(out.head_start[index]), int(out.head_end[index]),
+                ))
+                out.tail_keys.append((
+                    _query_type(layout, tquery) if layout is not None else str(tquery),
+                    int(out.tail_start[index]), int(out.tail_end[index]),
+                ))
+        return out
 
 
 class SparseRelationScorer(nn.Module):
@@ -159,16 +292,33 @@ class SparseRelationScorer(nn.Module):
     relative order and a normalized distance) — no dense pair matrix.
     """
 
-    def __init__(self, hidden_size: int, dropout: float = 0.0) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        dropout: float = 0.0,
+        relation_query_dim: int | None = None,
+        use_biaffine_content: bool = False,
+    ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        in_dim = 5 * hidden_size + 2
+        self.relation_query_dim = relation_query_dim or hidden_size
+        self.use_biaffine_content = use_biaffine_content
+        in_dim = 4 * hidden_size + self.relation_query_dim + 2
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden_size),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_size, 1),
         )
+        if use_biaffine_content:
+            self.head_content_projection = nn.Linear(hidden_size, hidden_size)
+            self.tail_content_projection = nn.Linear(hidden_size, hidden_size)
+            self.relation_content_gate = nn.Linear(
+                self.relation_query_dim, hidden_size
+            )
+            self.content_linear = nn.Linear(
+                2 * hidden_size + self.relation_query_dim, 1
+            )
 
     def forward(
         self,
@@ -198,7 +348,40 @@ class SparseRelationScorer(nn.Module):
         dist = (delta.abs() / float(max(length, 1))).unsqueeze(-1)
 
         feats = torch.cat([h_start, h_end, t_start, t_end, rel, order, dist], dim=-1)
-        return self.mlp(feats).squeeze(-1)
+        score = self.mlp(feats).squeeze(-1)
+        if self.use_biaffine_content:
+            prefix = torch.cat(
+                (
+                    boundary_states.new_zeros(
+                        boundary_states.shape[0], 1, self.hidden_size
+                    ),
+                    boundary_states.float().cumsum(1).to(boundary_states.dtype),
+                ),
+                dim=1,
+            )
+
+            def pool(start: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
+                span_sum = prefix[b, end.clamp(0, length)] - prefix[
+                    b, start.clamp(0, length)
+                ]
+                width = (end - start).clamp_min(1).unsqueeze(-1).to(span_sum.dtype)
+                return span_sum / width
+
+            head_content = self.head_content_projection(
+                pool(relation_pairs.head_start, relation_pairs.head_end)
+            )
+            tail_content = self.tail_content_projection(
+                pool(relation_pairs.tail_start, relation_pairs.tail_end)
+            )
+            gate = torch.sigmoid(self.relation_content_gate(rel))
+            biaffine = (
+                head_content * gate * tail_content
+            ).sum(-1) / (self.hidden_size ** 0.5)
+            linear = self.content_linear(
+                torch.cat((head_content, tail_content, rel), dim=-1)
+            ).squeeze(-1)
+            score = score + biaffine + linear
+        return score
 
 
 __all__ = [
