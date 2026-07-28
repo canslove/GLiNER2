@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from gliner2.models.boundary.constants import MASK_LOGIT
 from gliner2.models.boundary.heads import BoundaryQueryHead
 
 
@@ -37,10 +38,9 @@ def test_head_masks_invalid_boundaries_and_queries():
     qm[1, 2] = False             # invalid query 2 for sample 1
     head = BoundaryQueryHead(hidden_size=h, boundary_dim=d, query_dim=h)
     out = head(bs, bm, ts, tm, qs, qm)
-    min_val = torch.finfo(out.start_logits.dtype).min
-    assert (out.start_logits[0, :, -1] == min_val).all()
-    assert (out.start_logits[1, 2] == min_val).all()
-    assert (out.inside_logits[1, 2] == min_val).all()
+    assert (out.start_logits[0, :, -1] == MASK_LOGIT).all()
+    assert (out.start_logits[1, 2] == MASK_LOGIT).all()
+    assert (out.inside_logits[1, 2] == MASK_LOGIT).all()
 
 
 def test_inside_prefix_difference_equals_interval_sum():
@@ -51,7 +51,11 @@ def test_inside_prefix_difference_equals_interval_sum():
     # For fully valid inputs, prefix[j] - prefix[i] == sum inside_logits[i:j]
     i, j = 1, 4
     expected = out.inside_logits[0, 0, i:j].sum()
-    got = out.inside_prefix[0, 0, j] - out.inside_prefix[0, 0, i]
+    got = (
+        out.inside_prefix[0, 0, j]
+        - out.inside_prefix[0, 0, i]
+        + out.inside_prefix_mean[0, 0, 0] * (j - i)
+    )
     assert torch.allclose(got, expected, atol=1e-6)
     # prefix starts at zero
     assert torch.allclose(out.inside_prefix[..., 0], torch.zeros_like(out.inside_prefix[..., 0]))

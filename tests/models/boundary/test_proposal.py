@@ -11,7 +11,6 @@ from gliner2.models.boundary.proposal import (
     SparseBoundaryProposer,
     deduplicate_boundary_pairs,
 )
-from gliner2.processing.targets import TargetCapacityError
 
 
 def _settings(**overrides):
@@ -25,6 +24,7 @@ def _settings(**overrides):
         max_gold_per_query=6,
         end_block_size=4,
         bidirectional=True,
+        export_mode="streaming",
     )
     base.update(overrides)
     return ProposalSettings(**base)
@@ -55,6 +55,67 @@ def test_dedup_keeps_highest_score_and_stable_order():
     assert (1, 3, pytest.approx(0.5)) in [(a, b, pytest.approx(c)) for a, b, c in pairs]
     # descending by score
     assert sc[0] >= sc[1]
+
+
+def _dedup_reference(starts, ends, scores, valid):
+    """Straightforward dict-based reference for the vectorized dedup path."""
+    best = {}
+    for i in range(starts.shape[0]):
+        if not bool(valid[i]):
+            continue
+        key = (int(starts[i]), int(ends[i]))
+        sc = float(scores[i])
+        if key not in best or sc > best[key]:
+            best[key] = sc
+    if not best:
+        empty_l = torch.zeros(0, dtype=torch.long)
+        empty_f = torch.zeros(0, dtype=scores.dtype)
+        return empty_l, empty_l, empty_f
+    items = list(best.items())
+    s_t = torch.tensor([k[0] for k, _ in items], dtype=torch.long)
+    e_t = torch.tensor([k[1] for k, _ in items], dtype=torch.long)
+    sc_t = torch.tensor([v for _, v in items], dtype=scores.dtype)
+    # score desc, start asc, end asc
+    order = sorted(range(len(items)),
+                   key=lambda i: (-float(sc_t[i]), int(s_t[i]), int(e_t[i])))
+    idx = torch.tensor(order, dtype=torch.long)
+    return s_t[idx], e_t[idx], sc_t[idx]
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_dedup_matches_reference_across_random_inputs(seed):
+    torch.manual_seed(seed)
+    n = int(torch.randint(0, 40, (1,)).item())
+    # Small coordinate range forces frequent duplicate keys and score ties.
+    starts = torch.randint(0, 5, (n,))
+    ends = torch.randint(0, 5, (n,)) + starts + 1
+    scores = torch.randint(0, 4, (n,)).to(torch.float32)  # integer scores -> exact ties
+    valid = torch.rand(n) > 0.3 if n else torch.zeros(0, dtype=torch.bool)
+
+    s, e, sc = deduplicate_boundary_pairs(starts, ends, scores, valid)
+    rs, re, rsc = _dedup_reference(starts, ends, scores, valid)
+
+    assert torch.equal(s, rs)
+    assert torch.equal(e, re)
+    assert torch.equal(sc, rsc)
+    # Contract: descending score and unique keys.
+    if s.numel() > 1:
+        assert torch.all(sc[:-1] >= sc[1:])
+    keys = {(int(a), int(b)) for a, b in zip(s.tolist(), e.tolist())}
+    assert len(keys) == s.shape[0]
+
+
+def test_dedup_empty_and_all_invalid_return_empty():
+    starts = torch.tensor([0, 1, 2])
+    ends = torch.tensor([1, 2, 3])
+    scores = torch.tensor([0.5, 0.6, 0.7])
+    none_valid = torch.zeros(3, dtype=torch.bool)
+    for args in ((starts, ends, scores, none_valid),
+                 (torch.zeros(0, dtype=torch.long), torch.zeros(0, dtype=torch.long),
+                  torch.zeros(0), torch.zeros(0, dtype=torch.bool))):
+        s, e, sc = deduplicate_boundary_pairs(*args)
+        assert s.numel() == 0 and e.numel() == 0 and sc.numel() == 0
+        assert s.dtype == torch.long and sc.dtype == args[2].dtype
 
 
 def test_proposals_are_half_open_and_shaped():
@@ -151,7 +212,9 @@ def test_gold_injection_recall_is_one():
             assert g in gold_pairs_out
 
 
-def test_capacity_error_when_gold_exceeds_budget():
+def test_direct_capacity_violation_is_safely_trimmed():
+    # Public configuration rejects this shape. A direct low-level caller still
+    # receives a bounded result without a device synchronization or overflow.
     s = _settings(training_candidate_budget=2)
     prop = SparseBoundaryProposer(boundary_dim=8, query_dim=8, settings=s).train()
     b, l, d, q = 1, 8, 8, 1
@@ -164,11 +227,12 @@ def test_capacity_error_when_gold_exceeds_budget():
     end_logits = torch.randn(b, q, l + 1)
     gold_pairs = torch.tensor([[[[0, 1], [1, 2], [2, 3]]]], dtype=torch.long)
     gold_mask = torch.ones(b, q, 3, dtype=torch.bool)
-    with pytest.raises(TargetCapacityError):
-        prop(
-            boundary_states, boundary_mask, query_states, query_mask,
-            start_logits, end_logits, gold_pairs=gold_pairs, gold_mask=gold_mask,
-        )
+    out = prop(
+        boundary_states, boundary_mask, query_states, query_mask,
+        start_logits, end_logits, gold_pairs=gold_pairs, gold_mask=gold_mask,
+    )
+    assert out.valid_mask.sum() == 2
+    assert out.gold_mask.sum() == 2
 
 
 def test_materialization_counters_bounded_and_linear():

@@ -9,6 +9,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 
+from gliner2.models.boundary.model import BoundaryExtractorModel
 from gliner2.training.data import InputExample
 from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
 
@@ -53,6 +54,60 @@ class _TestModel(nn.Module):
         target = Path(path)
         target.mkdir(parents=True, exist_ok=True)
         torch.save(self.state_dict(), target / "pytorch_model.bin")
+
+
+class _AsymmetricOptionalHeadModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.shared = nn.Linear(2, 2)
+        self.record_decoder = nn.Linear(2, 1)
+
+    def _head_touch(self, device):
+        return BoundaryExtractorModel._head_touch(self, device)
+
+    def _zero_loss(self, device):
+        return BoundaryExtractorModel._zero_loss(self, device)
+
+    def forward(self, values, use_record):
+        loss = self.shared(values).sum()
+        if use_record:
+            loss = loss + self.record_decoder(values).sum()
+        else:
+            loss = loss + BoundaryExtractorModel._head_touch(
+                self, values.device
+            )
+        return loss
+
+
+def _run_gloo_asymmetric_worker(rank: int, world_size: int, init_file: str):
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        torch.manual_seed(31)
+        model = _AsymmetricOptionalHeadModel()
+        ddp = torch.nn.parallel.DistributedDataParallel(
+            model,
+            find_unused_parameters=False,
+            static_graph=True,
+        )
+        values = torch.ones(2, 2)
+        forward_loss = ddp(values, rank == 0)
+        loss = (
+            forward_loss
+            if rank == 0
+            else forward_loss * 0.0
+            + BoundaryExtractorModel._zero_loss(ddp.module, values.device)
+        )
+        loss.backward()
+        for parameter in ddp.module.parameters():
+            assert parameter.grad is not None
+            assert torch.isfinite(parameter.grad).all()
+    finally:
+        dist.destroy_process_group()
 
 
 def _run_ddp_worker(rank: int, world_size: int, init_file: str, out_dir: str):
@@ -158,3 +213,18 @@ def test_two_process_ddp_training_saves_rank0_checkpoint(tmp_path):
     assert (out_dir / "final").is_dir()
     assert (out_dir / "final" / "pytorch_model.bin").exists()
     assert rank0["total_steps"] == rank1["total_steps"] == 1
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="CPU gloo distributed backend is unavailable",
+)
+def test_two_process_gloo_rank_asymmetric_no_supervision(tmp_path):
+    init_file = tmp_path / "gloo_asymmetric_init"
+    init_file.touch()
+    mp.spawn(
+        _run_gloo_asymmetric_worker,
+        args=(2, str(init_file)),
+        nprocs=2,
+        join=True,
+    )

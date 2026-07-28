@@ -58,8 +58,10 @@ from collections import Counter
 from tqdm import tqdm
 
 if TYPE_CHECKING:
-    # Forward declarations for type checking only
-    pass
+    # Import-only (avoids a circular import with the trainer at runtime) so the
+    # ``'ExtractorDataset'`` forward reference in ``DataInput`` resolves for
+    # static type checkers / ``get_type_hints``.
+    from gliner2.training.trainer import ExtractorDataset
 
 
 class DataValidationError(Exception):
@@ -775,7 +777,7 @@ class InputExample:
             for entity_type, mentions in self.entities.items():
                 if not entity_type:
                     types_to_remove.append(entity_type)
-                    warnings.append(f"Entity type is empty")
+                    warnings.append("Entity type is empty")
                     continue
                 
                 # Check if any mention is not in text
@@ -815,7 +817,7 @@ class InputExample:
             valid_structures = []
             for struct in self.structures:
                 if not struct.struct_name:
-                    warnings.append(f"Structure has empty name - dropping")
+                    warnings.append("Structure has empty name - dropping")
                     continue
                 
                 if not struct._fields:
@@ -860,7 +862,7 @@ class InputExample:
             valid_relations = []
             for rel in self.relations:
                 if not rel.name:
-                    warnings.append(f"Relation has empty name - dropping")
+                    warnings.append("Relation has empty name - dropping")
                     continue
                 
                 if not rel._fields:
@@ -1163,7 +1165,7 @@ class TrainingDataset:
         """Print formatted statistics."""
         s = self.stats()
         print(f"\n{'='*60}")
-        print(f"GLiNER2 Training Dataset Statistics")
+        print("GLiNER2 Training Dataset Statistics")
         print(f"{'='*60}")
         print(f"Total examples: {s['total_examples']}")
 
@@ -1171,7 +1173,7 @@ class TrainingDataset:
             tls = s['text_length_stats']
             print(f"\nText lengths: min={tls['min']}, max={tls['max']}, mean={tls['mean']:.1f}")
 
-        print(f"\nTask Distribution:")
+        print("\nTask Distribution:")
         for task, count in s['task_distribution'].items():
             if count > 0:
                 print(f"  {task}: {count} ({100*count/s['total_examples']:.1f}%)")
@@ -1182,7 +1184,7 @@ class TrainingDataset:
                 print(f"  {etype}: {count}")
 
         if s['classification_tasks']:
-            print(f"\nClassification Tasks:")
+            print("\nClassification Tasks:")
             for task, count in s['classification_tasks'].items():
                 print(f"  {task}: {count} examples")
                 if task in s['classification_labels']:
@@ -1190,12 +1192,12 @@ class TrainingDataset:
                         print(f"    - {label}: {lcount}")
 
         if s['structure_types']:
-            print(f"\nStructure Types:")
+            print("\nStructure Types:")
             for stype, count in s['structure_types'].items():
                 print(f"  {stype}: {count}")
 
         if s['relation_types']:
-            print(f"\nRelation Types:")
+            print("\nRelation Types:")
             for rtype, count in s['relation_types'].items():
                 print(f"  {rtype}: {count}")
 

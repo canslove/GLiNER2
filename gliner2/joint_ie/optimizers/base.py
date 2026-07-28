@@ -14,6 +14,11 @@ class JointSolution:
     nodes: Tuple[NodeCandidate, ...]
     edges: Tuple[EdgeCandidate, ...]
     score: float
+    # False signals that the decoder could not produce a constraint-satisfying
+    # non-trivial assignment and fell back (e.g. to the empty solution). A
+    # feasible solution — including the empty one produced when there is nothing
+    # to extract — is True.
+    feasible: bool = True
 
     @property
     def node_ids(self) -> FrozenSet[Hashable]:
@@ -45,18 +50,55 @@ class BaseOptimizer:
         return all(bool(self._invoke(getattr(c, "allow_node", None), node, nodes, edges, True))
                    for c in problem.constraints)
 
+    @staticmethod
+    def _resolve_edge(problem: JointProblem, edge: EdgeCandidate) -> Any:
+        from types import SimpleNamespace
+        node_by_id = problem.node_by_id
+        return SimpleNamespace(
+            relation_type=edge.relation_type, type=edge.relation_type,
+            head=node_by_id.get(edge.head, edge.head),
+            tail=node_by_id.get(edge.tail, edge.tail),
+            slot=edge.slot, candidate_id=edge.candidate_id)
+
     def allow_edge(self, problem: JointProblem, edge: EdgeCandidate,
                    nodes: Sequence[NodeCandidate], edges: Sequence[EdgeCandidate]) -> bool:
-        node_by_id = problem.node_by_id
-        def resolved(value: EdgeCandidate):
-            from types import SimpleNamespace
-            return SimpleNamespace(relation_type=value.relation_type, type=value.relation_type,
-                head=node_by_id[value.head], tail=node_by_id[value.tail], slot=value.slot,
-                candidate_id=value.candidate_id)
-        candidate = resolved(edge)
-        accepted = tuple(resolved(value) for value in edges)
+        candidate = self._resolve_edge(problem, edge)
+        accepted = tuple(self._resolve_edge(problem, value) for value in edges)
         return all(bool(self._invoke(getattr(c, "allow_edge", None), candidate, nodes, accepted, True))
                    for c in problem.constraints)
+
+    def validate_solution(self, problem: JointProblem, solution: JointSolution) -> bool:
+        """Recheck every hard constraint against the *final* assignment.
+
+        Incremental construction guarantees feasibility of the picked nodes and
+        edges, but :meth:`solution` may inject derived companion edges for
+        symmetric/inverse relations that were never screened. This replays the
+        incremental checks over the full assignment and then runs whole-result
+        ``validate`` hooks (e.g. symmetric/inverse completeness), so a returned
+        solution is never allowed to silently violate a declared constraint.
+        """
+        accepted_nodes: List[NodeCandidate] = []
+        for node in solution.nodes:
+            if not self.allow_node(problem, node, accepted_nodes + [node], solution.edges):
+                return False
+            accepted_nodes.append(node)
+        accepted_edges: List[EdgeCandidate] = []
+        for edge in solution.edges:
+            if not self.allow_edge(problem, edge, list(solution.nodes), accepted_edges):
+                return False
+            accepted_edges.append(edge)
+        resolved_relations = tuple(self._resolve_edge(problem, edge) for edge in solution.edges)
+        for constraint in problem.constraints:
+            validate = getattr(constraint, "validate", None)
+            if validate is None:
+                continue
+            try:
+                ok = validate(resolved_relations, list(solution.nodes))
+            except TypeError:
+                ok = validate(resolved_relations)
+            if not ok:
+                return False
+        return True
 
     def edge_penalty(self, problem: JointProblem, edge: EdgeCandidate,
                      nodes: Sequence[NodeCandidate], edges: Sequence[EdgeCandidate]) -> float:

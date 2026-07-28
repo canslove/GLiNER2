@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from gliner2.models.boundary.losses import (
@@ -31,6 +32,25 @@ def test_balanced_multilabel_bce_empty_query_is_finite_and_zeroish():
     loss = balanced_multilabel_bce(logits, targets, valid)
     assert torch.isfinite(loss)
     assert float(loss) == 0.0
+
+
+def test_balanced_multilabel_bce_downweights_negatives():
+    # One positive, three negatives; all valid. With negative_weight < 1 the
+    # negative contribution shrinks, so the loss must strictly decrease.
+    logits = torch.zeros(1, 1, 4)          # p = 0.5 everywhere
+    targets = torch.tensor([[[1.0, 0.0, 0.0, 0.0]]])
+    valid = torch.ones(1, 1, 4, dtype=torch.bool)
+
+    full = float(balanced_multilabel_bce(logits, targets, valid, negative_weight=1.0))
+    down = float(balanced_multilabel_bce(logits, targets, valid, negative_weight=0.5))
+
+    ln2 = 0.6931471805599453
+    # bce = ln2 everywhere (p=0.5). Denominator = valid count = 4.
+    # full = (1*ln2 + 3*ln2)/4 = ln2
+    assert full == pytest.approx(ln2, rel=1e-5)
+    # down = (1*ln2 + 3*0.5*ln2)/4 = (ln2 + 1.5 ln2)/4 = 2.5 ln2 / 4
+    assert down == pytest.approx(2.5 * ln2 / 4, rel=1e-5)
+    assert down < full
 
 
 def test_balanced_multilabel_bce_handles_extreme_masked_logits():

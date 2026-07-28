@@ -8,10 +8,16 @@ truncate gold annotations.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, List, Mapping, Optional, Sequence, Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
+
+# Valid values for the gold-capacity overflow policy.
+CAPACITY_POLICIES = ("raise", "truncate_with_warning", "skip_sample")
 
 
 class TargetCapacityError(ValueError):
@@ -271,12 +277,16 @@ class PaddedTargetBatch:
     """
     mention_pairs: torch.LongTensor
     mention_mask: torch.BoolTensor
-    start_targets: torch.Tensor
-    end_targets: torch.Tensor
+    start_targets: Optional[torch.Tensor]
+    end_targets: Optional[torch.Tensor]
     inside_targets: Optional[torch.Tensor] = None
     classification_targets: Optional[torch.Tensor] = None
     instance_targets: Any = None
     edge_targets: Any = None
+    # Collator-built dense record spans:
+    # (spans [B,R,N,F,S,2], span_mask [B,R,N,F,S],
+    #  record_mask [B,R,N]).
+    record_targets: Any = None
     # Per-sample record instance targets: List[List[RecordTarget]] or None.
     # Kept as opaque Python objects (span-based, device-independent) so the
     # record loss can map gold spans to per-sample candidate indices.
@@ -285,30 +295,44 @@ class PaddedTargetBatch:
     def to(self, device) -> "PaddedTargetBatch":
         def mv(t):
             return t.to(device) if t is not None else None
+        edge_targets = self.edge_targets
+        if isinstance(edge_targets, tuple):
+            edge_targets = tuple(mv(t) for t in edge_targets)
+        record_targets = self.record_targets
+        if isinstance(record_targets, tuple):
+            record_targets = tuple(mv(t) for t in record_targets)
         return PaddedTargetBatch(
             mention_pairs=self.mention_pairs.to(device),
             mention_mask=self.mention_mask.to(device),
-            start_targets=self.start_targets.to(device),
-            end_targets=self.end_targets.to(device),
+            start_targets=mv(self.start_targets),
+            end_targets=mv(self.end_targets),
             inside_targets=mv(self.inside_targets),
             classification_targets=mv(self.classification_targets),
             instance_targets=self.instance_targets,
-            edge_targets=self.edge_targets,
+            edge_targets=edge_targets,
+            record_targets=record_targets,
             records=self.records,
         )
 
     def pin_memory(self) -> "PaddedTargetBatch":
         def pin(t):
             return t.pin_memory() if t is not None else None
+        edge_targets = self.edge_targets
+        if isinstance(edge_targets, tuple):
+            edge_targets = tuple(pin(t) for t in edge_targets)
+        record_targets = self.record_targets
+        if isinstance(record_targets, tuple):
+            record_targets = tuple(pin(t) for t in record_targets)
         return PaddedTargetBatch(
             mention_pairs=self.mention_pairs.pin_memory(),
             mention_mask=self.mention_mask.pin_memory(),
-            start_targets=self.start_targets.pin_memory(),
-            end_targets=self.end_targets.pin_memory(),
+            start_targets=pin(self.start_targets),
+            end_targets=pin(self.end_targets),
             inside_targets=pin(self.inside_targets),
             classification_targets=pin(self.classification_targets),
             instance_targets=self.instance_targets,
-            edge_targets=self.edge_targets,
+            edge_targets=edge_targets,
+            record_targets=record_targets,
             records=self.records,
         )
 
@@ -317,62 +341,136 @@ def pad_target_graphs(
     graphs: Sequence[TargetGraph],
     query_counts: Sequence[int],
     text_lengths: Sequence[int],
-    max_gold_per_query: int,
+    max_gold_per_query: Optional[int],
+    *,
+    device: Optional[torch.device] = None,
+    on_capacity_exceeded: str = "raise",
+    build_dense: bool = True,
 ) -> PaddedTargetBatch:
     """Pad a list of target graphs into a ``PaddedTargetBatch``.
 
     Every unique gold mention is retained. If any (sample, query) has more
-    unique mentions than ``max_gold_per_query`` a :class:`TargetCapacityError`
-    is raised — gold is never silently truncated.
+    unique mentions than ``max_gold_per_query`` the behavior is governed by
+    ``on_capacity_exceeded``:
+
+    * ``"raise"`` (default): raise :class:`TargetCapacityError` — gold is never
+      silently truncated (the default preserves the no-silent-loss contract).
+    * ``"truncate_with_warning"``: keep the first ``max_gold_per_query`` unique
+      pairs for the offending query and log a warning with explicit counts.
+    * ``"skip_sample"``: drop *all* gold for the offending sample (its targets
+      become empty) and log a warning; the sample still occupies its batch slot
+      but contributes no extraction supervision.
+
+    ``device`` allocates the padded tensors directly on the given device
+    (defense in depth so a fallback target path cannot leave CPU tensors to
+    meet accelerator logits downstream).
     """
+    if on_capacity_exceeded not in CAPACITY_POLICIES:
+        raise ValueError(
+            f"on_capacity_exceeded must be one of {CAPACITY_POLICIES}, "
+            f"got {on_capacity_exceeded!r}"
+        )
     b = len(graphs)
     if not (len(query_counts) == b and len(text_lengths) == b):
         raise ValueError("graphs, query_counts, text_lengths must be equal length")
     q = max(query_counts) if query_counts else 0
     l = max(text_lengths) if text_lengths else 0
-    g = max_gold_per_query
-
-    mention_pairs = torch.zeros(b, q, g, 2, dtype=torch.long)
-    mention_mask = torch.zeros(b, q, g, dtype=torch.bool)
-    start_targets = torch.zeros(b, q, l + 1)
-    end_targets = torch.zeros(b, q, l + 1)
-    inside_targets = torch.zeros(b, q, l)
-
+    # Validate and group before allocating.  ``None`` is the allocation-safe
+    # preflight mode: pad only to the largest count observed in this batch
+    # instead of manufacturing an enormous artificial capacity.
+    grouped_mentions: list[dict[int, list[tuple[int, int]]]] = []
+    observed_max = 0
     for bi, (graph, qc, tl) in enumerate(zip(graphs, query_counts, text_lengths)):
-        # Group unique mentions per query.
-        per_query: dict = {}
-        for m in graph.mentions:
-            if not (0 <= m.query_id < qc):
+        per_query: dict[int, list[tuple[int, int]]] = {}
+        for mention in graph.mentions:
+            if not (0 <= mention.query_id < qc):
                 raise ValueError(
-                    f"sample={bi} mention query_id {m.query_id} outside query_count {qc}"
+                    f"sample={bi} mention query_id {mention.query_id} "
+                    f"outside query_count {qc}"
                 )
-            if not (0 <= m.start < m.end <= tl):
+            if not (0 <= mention.start < mention.end <= tl):
                 raise ValueError(
-                    f"sample={bi} mention [{m.start}, {m.end}) out of range for length {tl}"
+                    f"sample={bi} mention [{mention.start}, {mention.end}) "
+                    f"out of range for length {tl}"
                 )
-            per_query.setdefault(m.query_id, [])
-            pair = (m.start, m.end)
-            if pair not in per_query[m.query_id]:
-                per_query[m.query_id].append(pair)
+            pairs = per_query.setdefault(mention.query_id, [])
+            pair = (mention.start, mention.end)
+            if pair not in pairs:
+                pairs.append(pair)
+        observed_max = max(
+            observed_max, max((len(pairs) for pairs in per_query.values()), default=0)
+        )
+        grouped_mentions.append(per_query)
+
+    if max_gold_per_query is None:
+        g = max(observed_max, 1)
+    else:
+        if max_gold_per_query <= 0:
+            raise ValueError("max_gold_per_query must be > 0 or None")
+        g = max_gold_per_query
+
+    mention_pairs = torch.zeros(b, q, g, 2, dtype=torch.long, device=device)
+    mention_mask = torch.zeros(b, q, g, dtype=torch.bool, device=device)
+    truncated_pairs = 0
+    skipped_samples = 0
+
+    for bi, per_query in enumerate(grouped_mentions):
+        # skip_sample: if any query overflows, drop this sample's gold entirely.
+        if on_capacity_exceeded == "skip_sample" and any(
+            len(pairs) > g for pairs in per_query.values()
+        ):
+            overflow = {qi: len(p) for qi, p in per_query.items() if len(p) > g}
+            logger.warning(
+                "sample=%d skipped: gold capacity exceeded (max_gold_per_query=%d, "
+                "overflowing queries=%s)", bi, g, overflow
+            )
+            skipped_samples += 1
+            continue
 
         for qi, pairs in per_query.items():
             if len(pairs) > g:
-                raise TargetCapacityError(
-                    f"sample={bi} query_id={qi} contains {len(pairs)} gold spans, "
-                    f"but max_gold_per_query={g}. Increase "
-                    "boundary_head.max_gold_per_query and "
-                    "boundary_head.training_candidate_budget."
+                if on_capacity_exceeded == "raise":
+                    raise TargetCapacityError(
+                        f"sample={bi} query_id={qi} contains {len(pairs)} gold spans, "
+                        f"but max_gold_per_query={g}. Increase "
+                        "boundary_head.max_gold_per_query and "
+                        "boundary_head.training_candidate_budget."
+                    )
+                # truncate_with_warning
+                dropped = len(pairs) - g
+                truncated_pairs += dropped
+                logger.warning(
+                    "sample=%d query_id=%d truncated %d gold span(s) to fit "
+                    "max_gold_per_query=%d", bi, qi, dropped, g
                 )
-            for k, (s, e) in enumerate(pairs):
-                mention_pairs[bi, qi, k, 0] = s
-                mention_pairs[bi, qi, k, 1] = e
-                mention_mask[bi, qi, k] = True
-                start_targets[bi, qi, s] = 1.0
-                end_targets[bi, qi, e] = 1.0
-                inside_targets[bi, qi, s:e] = 1.0
+                pairs = pairs[:g]
+            count = len(pairs)
+            if count:
+                mention_pairs[bi, qi, :count] = torch.as_tensor(
+                    pairs, dtype=torch.long, device=device
+                )
+                mention_mask[bi, qi, :count] = True
+
+    if truncated_pairs:
+        logger.warning(
+            "pad_target_graphs truncated %d gold span(s) across the batch "
+            "(on_capacity_exceeded='truncate_with_warning')", truncated_pairs
+        )
+    if skipped_samples:
+        logger.warning(
+            "pad_target_graphs skipped %d sample(s) for gold capacity "
+            "(on_capacity_exceeded='skip_sample')", skipped_samples
+        )
 
     records = [list(graph.records) for graph in graphs]
     has_records = any(records)
+    start_targets = end_targets = inside_targets = None
+    if build_dense:
+        from gliner2.models.boundary.targets_device import dense_targets_from_pairs
+
+        start_targets, end_targets, inside_targets = dense_targets_from_pairs(
+            mention_pairs, mention_mask, l
+        )
     return PaddedTargetBatch(
         mention_pairs=mention_pairs,
         mention_mask=mention_mask,

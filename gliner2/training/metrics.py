@@ -7,6 +7,7 @@ are half-open ``[start, end)``.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -14,6 +15,8 @@ import torch
 
 from gliner2.models.outputs import CandidateTensorBatch
 from gliner2.processing.targets import PaddedTargetBatch, TargetGraph
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -35,49 +38,26 @@ class BoundaryTrainingMetrics:
         return asdict(self)
 
 
-def _pairs_from_padded(targets: PaddedTargetBatch) -> List[List[set]]:
-    """Gold ``{(start, end)}`` sets indexed ``[b][q]`` from padded targets."""
-    b, q, g, _ = targets.mention_pairs.shape
-    out: List[List[set]] = []
-    for bi in range(b):
-        per_q = []
-        for qi in range(q):
-            s = set()
-            for gi in range(g):
-                if bool(targets.mention_mask[bi, qi, gi]):
-                    st = int(targets.mention_pairs[bi, qi, gi, 0])
-                    en = int(targets.mention_pairs[bi, qi, gi, 1])
-                    s.add((st, en))
-            per_q.append(s)
-        out.append(per_q)
-    return out
-
-
 def candidate_oracle_recall(
     candidates: CandidateTensorBatch,
     targets: PaddedTargetBatch,
 ) -> float:
-    """Fraction of gold mentions present among the proposed candidates."""
-    gold = _pairs_from_padded(targets)
-    b, q, c, _ = candidates.indices.shape
-    total = 0
-    hit = 0
-    for bi in range(b):
-        for qi in range(q):
-            g = gold[bi][qi]
-            if not g:
-                continue
-            present = set()
-            for ci in range(c):
-                if bool(candidates.valid_mask[bi, qi, ci]):
-                    present.add(
-                        (int(candidates.indices[bi, qi, ci, 0]), int(candidates.indices[bi, qi, ci, 1]))
-                    )
-            for pair in g:
-                total += 1
-                if pair in present:
-                    hit += 1
-    return hit / total if total else 1.0
+    """Fraction of gold mentions present among the proposed candidates.
+
+    The comparison is fully tensorized and performs a single host transfer for
+    the final scalar result.
+    """
+    candidate = candidates.indices.unsqueeze(2)       # [B,Q,1,C,2]
+    gold = targets.mention_pairs.unsqueeze(3)         # [B,Q,G,1,2]
+    same = (candidate == gold).all(-1)
+    same = same & candidates.valid_mask.unsqueeze(2)
+    hit = (same.any(-1) & targets.mention_mask).sum()
+    total = targets.mention_mask.sum()
+    total_value = int(total)
+    if total_value == 0:
+        logger.warning("candidate_oracle_recall: no gold mentions; reporting 0.0")
+        return 0.0
+    return float(hit) / total_value
 
 
 def boundary_recall(
@@ -92,16 +72,35 @@ def boundary_recall(
     pred = (marginal_logits > threshold) & keep_mask
     tp = int((gold & pred).sum())
     total = int(gold.sum())
-    return tp / total if total else 1.0
+    if not total:
+        logger.warning("boundary_recall: no gold boundaries; reporting 0.0")
+        return 0.0
+    return tp / total
 
 
 def f1_from_counts(
     true_positive: int,
     false_positive: int,
     false_negative: int,
+    *,
+    zero_division: float = 0.0,
 ) -> Tuple[float, float, float]:
-    precision = true_positive / (true_positive + false_positive) if (true_positive + false_positive) else 1.0
-    recall = true_positive / (true_positive + false_negative) if (true_positive + false_negative) else 1.0
+    """Precision/recall/F1 from counts.
+
+    A zero denominator yields ``zero_division`` (default ``0.0``, matching the
+    sklearn convention). This makes ``tp = fp = fn = 0`` score ``0.0`` rather
+    than a misleading ``1.0`` that could promote a model producing nothing.
+    """
+    if (true_positive + false_positive):
+        precision = true_positive / (true_positive + false_positive)
+    else:
+        logger.warning("f1_from_counts: no predictions; precision=%s", zero_division)
+        precision = zero_division
+    if (true_positive + false_negative):
+        recall = true_positive / (true_positive + false_negative)
+    else:
+        logger.warning("f1_from_counts: no gold; recall=%s", zero_division)
+        recall = zero_division
     if precision + recall == 0:
         return precision, recall, 0.0
     f1 = 2 * precision * recall / (precision + recall)

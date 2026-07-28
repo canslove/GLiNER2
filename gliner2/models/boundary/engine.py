@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 from collections import OrderedDict
 from typing import Any, Dict, List, Tuple
 
@@ -9,21 +10,71 @@ import torch
 
 from gliner2.inference.candidate_decoder import token_boundaries_to_character_offsets
 from gliner2.inference.runtime import ExtractorRuntimeMixin
-from gliner2.models.boundary.model import BoundaryExtractorModel
+from gliner2.models.boundary.model import (
+    BoundaryExtractorModel,
+    _group_scored_candidates,
+)
 from gliner2.models.base import QueryLayout
-from gliner2.models.boundary.record_decode import decode_group
+from gliner2.models.boundary.records import decode_group
 
 
 def _resolve_flat_spans(
     scored: List[Tuple[float, int, int]]
 ) -> List[Tuple[float, int, int]]:
-    """Greedy flat-span policy: keep highest-scoring, drop overlapping spans."""
-    scored = sorted(scored, key=lambda t: (-t[0], t[1], t[2]))
+    """Maximum-total-score non-overlapping subset via interval scheduling."""
+    if not scored:
+        return []
+    spans = sorted(scored, key=lambda item: (item[2], item[1], -item[0]))
+    ends = [end for _, _, end in spans]
+    predecessors = [
+        bisect.bisect_right(ends, start, 0, index) - 1
+        for index, (_, start, _) in enumerate(spans)
+    ]
+    best = [0.0] * (len(spans) + 1)
+    choose = [False] * len(spans)
+    for index, (score, _, _) in enumerate(spans):
+        with_span = score + best[predecessors[index] + 1]
+        without_span = best[index]
+        if with_span > without_span:
+            best[index + 1] = with_span
+            choose[index] = True
+        else:
+            best[index + 1] = without_span
     kept: List[Tuple[float, int, int]] = []
-    for score, s, e in scored:
-        if all(e <= ks or s >= ke for _, ks, ke in kept):
-            kept.append((score, s, e))
-    return kept
+    index = len(spans) - 1
+    while index >= 0:
+        if choose[index] and (
+            spans[index][0] + best[predecessors[index] + 1] > best[index]
+        ):
+            kept.append(spans[index])
+            index = predecessors[index]
+        else:
+            index -= 1
+    return sorted(kept, key=lambda item: (-item[0], item[1], item[2]))
+
+
+def _resolve_spans(
+    scored: List[Tuple[float, int, int]], policy: str
+) -> List[Tuple[float, int, int]]:
+    if policy == "flat":
+        return _resolve_flat_spans(scored)
+    ranked = sorted(scored, key=lambda item: (-item[0], item[1], item[2]))
+    if policy == "nested":
+        return ranked
+    if policy == "longest":
+        kept = []
+        for candidate in ranked:
+            _, start, end = candidate
+            if any(
+                kept_start <= start
+                and end <= kept_end
+                and (kept_start < start or end < kept_end)
+                for _, kept_start, kept_end in kept
+            ):
+                continue
+            kept.append(candidate)
+        return kept
+    raise ValueError(f"unknown boundary overlap policy {policy!r}")
 
 
 class BoundaryExtractor(ExtractorRuntimeMixin, BoundaryExtractorModel):
@@ -49,6 +100,8 @@ class BoundaryExtractor(ExtractorRuntimeMixin, BoundaryExtractorModel):
         has_queries = core["query_states"].shape[1] > 0
         candidates = None
         probs = None
+        grouped_candidates = None
+        null_probs = None
         if has_queries:
             out = self.boundary_head(
                 core["text_states"], core["text_mask"],
@@ -56,11 +109,27 @@ class BoundaryExtractor(ExtractorRuntimeMixin, BoundaryExtractorModel):
                 return_candidates=True,
             )
             candidates = out.candidates
-            probs = torch.sigmoid(candidates.pair_logits)
+            probs = torch.sigmoid(
+                candidates.pair_logits
+                / self.boundary_settings.pair_temperature
+            )
+            grouped_candidates = _group_scored_candidates(
+                candidates,
+                threshold=threshold,
+                probabilities=probs,
+                count_log_rates=out.count_log_rates,
+                adaptive_threshold=self.boundary_settings.adaptive_threshold,
+            )
+            if out.null_logits is not None:
+                null_probs = torch.sigmoid(out.null_logits).float().cpu()
 
         results: List[Dict[str, Any]] = []
         for i in range(len(batch)):
             sample: Dict[str, Any] = {}
+            overlap_policy = (
+                metadata_list[i].get("_overlap_policy")
+                or self.boundary_settings.overlap_policy
+            )
             specs = core["ext_specs"][i] if has_queries else []
             offset = core["word_offsets"][i]
             start_map = batch.start_mappings[i]
@@ -86,21 +155,16 @@ class BoundaryExtractor(ExtractorRuntimeMixin, BoundaryExtractorModel):
             for qid, spec in enumerate(specs):
                 if spec["task_type"] != "entities":
                     continue  # non-entity queries are decoded by the record head
-                scored: List[Tuple[float, int, int]] = []
-                if bool(candidates.query_mask[i, qid]):
-                    c = candidates.indices.shape[2]
-                    for ci in range(c):
-                        if not bool(candidates.valid_mask[i, qid, ci]):
-                            continue
-                        p = float(probs[i, qid, ci])
-                        if p < threshold:
-                            continue
-                        s = int(candidates.indices[i, qid, ci, 0])
-                        e = int(candidates.indices[i, qid, ci, 1])
-                        scored.append((p, s, e))
-
+                scored = grouped_candidates[i][qid]
+                if (
+                    null_probs is not None
+                    and float(null_probs[i, qid])
+                    > self.boundary_settings.abstention_threshold
+                ):
+                    entity_results[spec["field_name"]] = []
+                    continue
                 spans: List[Tuple[str, float, int, int]] = []
-                for p, s, e in _resolve_flat_spans(scored):
+                for p, s, e in _resolve_spans(scored, overlap_policy):
                     ts, te = s - offset, e - offset
                     if ts < 0 or te > text_len or te <= ts:
                         continue
@@ -123,6 +187,7 @@ class BoundaryExtractor(ExtractorRuntimeMixin, BoundaryExtractorModel):
                 self._extract_classification_result(
                     sample, cls["task_name"], schema,
                     cls["group_embs"], cls["schema_tokens"],
+                    temperature=self.boundary_settings.classification_temperature,
                 )
 
             results.append(sample)
@@ -167,7 +232,9 @@ class BoundaryExtractor(ExtractorRuntimeMixin, BoundaryExtractorModel):
             sample_candidates,
             pairs,
         )
-        probabilities = torch.sigmoid(logits)
+        probabilities = torch.sigmoid(
+            logits / self.boundary_settings.relation_temperature
+        )
         out: Dict[str, Any] = {}
         relation_metadata = metadata.get("relation_metadata", {})
         for pair_index, probability in enumerate(probabilities):
@@ -270,6 +337,7 @@ class BoundaryExtractor(ExtractorRuntimeMixin, BoundaryExtractorModel):
                 anchor_threshold=settings.record_anchor_threshold,
                 field_threshold=settings.record_field_threshold,
                 object_threshold=settings.record_anchor_threshold,
+                temperature=settings.record_temperature,
             )
             instances = []
             for rec in decoded:

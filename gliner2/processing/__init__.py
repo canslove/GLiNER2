@@ -3,6 +3,7 @@
 from gliner2.processing.layouts import (
     build_query_layout,
     SpanAnnotation,
+    validate_target_graph,
 )
 from gliner2.processing.targets import (
     MentionTarget,
@@ -30,8 +31,6 @@ from gliner2.processing.records import (
     compile_record_specs,
     normalize_record_metadata,
 )
-from gliner2.processing.validation import validate_target_graph
-
 __all__ = [
     "build_query_layout",
     "SpanAnnotation",

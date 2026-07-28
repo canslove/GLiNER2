@@ -2,7 +2,7 @@
 
 All scores are dot-product attention between projected boundary/token states
 and projected query states, scaled by ``1/sqrt(d)``. Masks use
-``torch.finfo(dtype).min`` so FP16/BF16 remain finite. No tensor is ``[L, L]``:
+Masks use a shared finite sentinel so sums remain finite in mixed precision. No tensor is ``[L, L]``:
 ``inside_prefix`` is a cumulative sum of length ``L + 1``.
 """
 
@@ -15,6 +15,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from gliner2.models.boundary.constants import MASK_LOGIT
+
 
 @dataclass
 class BoundaryMarginals:
@@ -22,12 +24,12 @@ class BoundaryMarginals:
     end_logits: torch.Tensor      # [B, Q, L + 1]
     inside_logits: torch.Tensor   # [B, Q, L]
     inside_prefix: torch.Tensor   # [B, Q, L + 1]
+    inside_prefix_mean: torch.Tensor  # [B, Q, 1], restores centered intervals
 
 
 def _masked_fill_min(logits: torch.Tensor, keep_mask: torch.BoolTensor) -> torch.Tensor:
-    """Fill positions where ``keep_mask`` is False with the dtype minimum."""
-    min_val = torch.finfo(logits.dtype).min
-    return logits.masked_fill(~keep_mask, min_val)
+    """Fill positions where ``keep_mask`` is False with a finite sentinel."""
+    return logits.masked_fill(~keep_mask, MASK_LOGIT)
 
 
 class BoundaryQueryHead(nn.Module):
@@ -77,15 +79,27 @@ class BoundaryQueryHead(nn.Module):
         # Inside prefix: cumulative sum over tokens; zero-out masked positions so
         # the prefix difference over [i, j) equals the sum of real inside scores.
         inside_for_prefix = inside_logits.masked_fill(~t_keep, 0.0)
+        # Center each query before an explicitly-fp32 cumulative sum. The mean
+        # is carried separately and restored by interval scoring, preserving
+        # exact values while preventing a large running offset.
+        inside_for_prefix = inside_for_prefix.float()
+        valid_count = t_keep.sum(-1, keepdim=True).clamp_min(1)
+        inside_mean = (
+            inside_for_prefix.sum(-1, keepdim=True) / valid_count
+        ).detach()
+        centered = (
+            inside_for_prefix - inside_mean
+        ) * t_keep.to(inside_for_prefix.dtype)
         zeros = torch.zeros(
-            inside_for_prefix.shape[0], inside_for_prefix.shape[1], 1,
-            dtype=inside_for_prefix.dtype, device=inside_for_prefix.device,
+            centered.shape[0], centered.shape[1], 1,
+            dtype=torch.float32, device=inside_for_prefix.device,
         )
-        inside_prefix = torch.cat([zeros, inside_for_prefix.cumsum(dim=-1)], dim=-1)  # [B,Q,L+1]
+        inside_prefix = torch.cat([zeros, centered.cumsum(dim=-1)], dim=-1)
 
         return BoundaryMarginals(
             start_logits=start_logits,
             end_logits=end_logits,
             inside_logits=inside_logits,
             inside_prefix=inside_prefix,
+            inside_prefix_mean=inside_mean,
         )

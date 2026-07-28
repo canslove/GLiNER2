@@ -79,6 +79,40 @@ def test_validate_boundary_head_budget_ordering():
         validate_boundary_head({"candidate_budget": 200, "training_candidate_budget": 100})
 
 
+def test_validate_boundary_head_loss_defaults():
+    result = validate_boundary_head({})
+    defaults = BoundaryHeadSettings()
+    assert result["boundary_negative_weight"] == defaults.boundary_negative_weight
+    assert result["boundary_marginal_loss"] == defaults.boundary_marginal_loss
+    assert result["classification_loss_weight"] == defaults.classification_loss_weight
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"boundary_negative_weight": 0.0},
+        {"boundary_negative_weight": -0.1},
+        {"boundary_negative_weight": 1.5},
+        {"boundary_marginal_loss": "softmax"},
+        {"classification_loss_weight": -1.0},
+    ],
+)
+def test_validate_boundary_head_rejects_invalid_loss_config(bad):
+    with pytest.raises(ValueError):
+        validate_boundary_head(bad)
+
+
+def test_validate_boundary_head_accepts_valid_loss_config():
+    result = validate_boundary_head({
+        "boundary_negative_weight": 0.25,
+        "boundary_marginal_loss": "asymmetric_focal",
+        "classification_loss_weight": 2.0,
+    })
+    assert result["boundary_negative_weight"] == 0.25
+    assert result["boundary_marginal_loss"] == "asymmetric_focal"
+    assert result["classification_loss_weight"] == 2.0
+
+
 # ---------------------------------------------------------------------------
 # Legacy fallback
 # ---------------------------------------------------------------------------

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import FrozenSet, Hashable, Tuple
+import logging
+from dataclasses import dataclass, replace
+from typing import FrozenSet, Hashable, List, Tuple
 
 from .base import BaseOptimizer, JointSolution
 from .greedy import GreedyOptimizer
 from ..candidates import EdgeCandidate, JointProblem
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -80,8 +83,32 @@ class BeamOptimizer(BaseOptimizer):
                     unique[key] = state
             beam = sorted(unique.values(), key=lambda s: (-s.score, self._signature(s)))[:self.beam_width]
 
-        best = max((self._finish_nodes(problem, state) for state in beam),
-                   key=lambda s: (s.score, tuple(reversed(self._signature(s)))))
-        result = self.solution(problem, best.node_ids, best.edges, best.score)
-        greedy = GreedyOptimizer().optimize(problem)
-        return greedy if greedy.score > result.score else result
+        # Materialize every candidate assignment (beam finishes plus the greedy
+        # baseline) and keep only those that satisfy the hard constraints after
+        # derived companions are injected. Greedy no longer substitutes
+        # unconditionally: a higher-scoring but infeasible assignment must not win.
+        candidates: List[JointSolution] = [
+            self.solution(problem, state.node_ids, state.edges, state.score)
+            for state in (self._finish_nodes(problem, s) for s in beam)
+        ]
+        candidates.append(GreedyOptimizer().optimize(problem))
+
+        feasible = [sol for sol in candidates if self.validate_solution(problem, sol)]
+        if feasible:
+            return max(feasible, key=self._solution_key)
+
+        # No non-trivial feasible assignment exists. The empty solution is always
+        # feasible; return it with an explicit infeasibility signal so callers can
+        # distinguish "nothing to extract" from "constraints could not be met".
+        logger.warning(
+            "joint-IE decoding found no constraint-satisfying assignment among %d "
+            "candidates; returning empty solution",
+            len(candidates),
+        )
+        empty = self.solution(problem, frozenset(), (), 0.0)
+        return replace(empty, feasible=False)
+
+    def _solution_key(self, solution: JointSolution):
+        return (solution.score,
+                tuple(sorted(map(str, solution.node_ids))),
+                tuple(str(edge.candidate_id) for edge in solution.edges))

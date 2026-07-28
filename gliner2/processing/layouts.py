@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional
 
 from gliner2.models.base import QueryLayout, QuerySpec
+from gliner2.processing.targets import TargetGraph
 
 
 @dataclass(frozen=True)
@@ -100,3 +101,52 @@ def build_query_layout(schema: Mapping[str, Any]) -> QueryLayout:
         task_index += 1
 
     return QueryLayout(queries=tuple(queries))
+
+
+def validate_target_graph(
+    graph: TargetGraph,
+    query_layout: QueryLayout,
+    text_length: int,
+) -> None:
+    """Validate a target graph against a query layout and text length."""
+    valid_ids = {query.query_id for query in query_layout.queries}
+    for mention in graph.mentions:
+        if mention.query_id not in valid_ids:
+            raise ValueError(
+                f"mention references unknown query_id {mention.query_id}; "
+                f"valid ids: {sorted(valid_ids)}"
+            )
+        if not (0 <= mention.start < mention.end <= text_length):
+            raise ValueError(
+                f"mention [{mention.start}, {mention.end}) invalid for text_length {text_length}"
+            )
+    for choice in graph.choices:
+        if choice.query_id not in valid_ids:
+            raise ValueError(f"choice references unknown query_id {choice.query_id}")
+    for edge in graph.edges:
+        if edge.query_id not in valid_ids:
+            raise ValueError(f"edge references unknown query_id {edge.query_id}")
+
+    seen_instance_ids = set()
+    for record in graph.records:
+        if record.instance_id in seen_instance_ids:
+            raise ValueError(f"duplicate record instance_id {record.instance_id!r}")
+        seen_instance_ids.add(record.instance_id)
+        if record.anchor_query_id is not None and record.anchor_query_id not in valid_ids:
+            raise ValueError(
+                f"record {record.instance_id!r} anchor references unknown "
+                f"query_id {record.anchor_query_id}"
+            )
+        for field_target in record.fields:
+            if field_target.query_id not in valid_ids:
+                raise ValueError(
+                    f"record {record.instance_id!r} field references unknown "
+                    f"query_id {field_target.query_id}"
+                )
+            for value in field_target.values:
+                for start, end in value:
+                    if not (0 <= start < end <= text_length):
+                        raise ValueError(
+                            f"record {record.instance_id!r} field {field_target.query_id} span "
+                            f"[{start}, {end}) invalid for text_length {text_length}"
+                        )

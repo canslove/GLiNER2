@@ -490,11 +490,34 @@ class GLiNER2API:
     def create_schema(self) -> SchemaAPI:
         """Create a new schema for defining extraction tasks."""
         return SchemaAPI()
-    
-    # -------------------------------------------------------------------------
-    # Entity Extraction Methods
-    # -------------------------------------------------------------------------
-    
+
+    # Shared request plumbing -------------------------------------------------
+
+    def _task_call(self, task, text, schema, threshold, format_results,
+                   include_confidence, include_spans):
+        """Dispatch a task through the shared HTTP request implementation."""
+        return self._make_request(
+            task=task,
+            text=text,
+            schema=schema,
+            threshold=threshold,
+            include_confidence=include_confidence,
+            include_spans=include_spans,
+            format_results=format_results,
+        )
+
+    @staticmethod
+    def _as_batch(result):
+        """Coerce a single-object reply into a one-element batch reply."""
+        return [result] if isinstance(result, dict) else result
+
+    @staticmethod
+    def _entity_schema(entity_types):
+        """Normalize entity descriptions to the established wire schema."""
+        return list(entity_types.keys()) if isinstance(entity_types, dict) else entity_types
+
+    # Entity Extraction Methods ----------------------------------------------
+
     def extract_entities(
         self,
         text: str,
@@ -504,44 +527,15 @@ class GLiNER2API:
         include_confidence: bool = False,
         include_spans: bool = False
     ) -> Dict[str, Any]:
-        """
-        Extract entities from text.
-        
-        Args:
-            text: Input text to extract entities from.
-            entity_types: List of entity types or dict with descriptions.
-            threshold: Minimum confidence threshold.
-            format_results: Whether to format results. If False, returns raw extraction data.
-            include_confidence: Whether to include confidence scores in results.
-            include_spans: Whether to include character-level start/end positions.
-        
-        Returns:
-            Dictionary with "entities" key containing extracted entities.
-            If include_confidence=True, entity values include confidence scores.
-            If include_spans=True, entity values include start/end positions.
-            If format_results=False, returns raw extraction data with positions.
-        """
-        # Normalize entity types to list
-        if isinstance(entity_types, dict):
-            entities = list(entity_types.keys())
-        else:
-            entities = entity_types
-        
-        result = self._make_request(
-            task="extract_entities",
-            text=text,
-            schema=entities,
-            threshold=threshold,
-            include_confidence=include_confidence,
-            include_spans=include_spans,
-            format_results=format_results,
+        """Extract entities from text."""
+        result = self._task_call(
+            "extract_entities", text, self._entity_schema(entity_types),
+            threshold, format_results, include_confidence, include_spans,
         )
-        
-        # Wrap result in expected format if needed (only for formatted results)
         if format_results and isinstance(result, dict) and "entities" not in result:
             return {"entities": result}
         return result
-    
+
     def batch_extract_entities(
         self,
         texts: List[str],
@@ -552,49 +546,14 @@ class GLiNER2API:
         include_confidence: bool = False,
         include_spans: bool = False
     ) -> List[Dict[str, Any]]:
-        """
-        Batch extract entities from multiple texts.
-        
-        Args:
-            texts: List of input texts.
-            entity_types: List of entity types or dict with descriptions.
-            batch_size: Batch size (used by API for optimization).
-            threshold: Minimum confidence threshold.
-            format_results: Whether to format results. If False, returns raw extraction data.
-            include_confidence: Whether to include confidence scores.
-            include_spans: Whether to include character-level start/end positions.
-        
-        Returns:
-            List of dictionaries with "entities" key.
-            If include_confidence=True, entity values include confidence scores.
-            If include_spans=True, entity values include start/end positions.
-            If format_results=False, returns raw extraction data with positions.
-        """
-        # Normalize entity types to list
-        if isinstance(entity_types, dict):
-            entities = list(entity_types.keys())
-        else:
-            entities = entity_types
-        
-        result = self._make_request(
-            task="extract_entities",
-            text=texts,
-            schema=entities,
-            threshold=threshold,
-            include_confidence=include_confidence,
-            include_spans=include_spans,
-            format_results=format_results,
-        )
-        
-        # Ensure result is a list
-        if isinstance(result, dict):
-            return [result]
-        return result
-    
-    # -------------------------------------------------------------------------
-    # Text Classification Methods
-    # -------------------------------------------------------------------------
-    
+        """Batch extract entities from multiple texts."""
+        return self._as_batch(self._task_call(
+            "extract_entities", texts, self._entity_schema(entity_types),
+            threshold, format_results, include_confidence, include_spans,
+        ))
+
+    # Text Classification Methods --------------------------------------------
+
     def classify_text(
         self,
         text: str,
@@ -604,63 +563,25 @@ class GLiNER2API:
         include_confidence: bool = False,
         include_spans: bool = False
     ) -> Dict[str, Any]:
-        """
-        Classify text into categories.
-        
-        Args:
-            text: Text to classify.
-            tasks: Classification tasks where keys are task names.
-            threshold: Confidence threshold.
-            format_results: Whether to format results. If False, returns raw extraction data.
-            include_confidence: Whether to include confidence scores.
-            include_spans: Whether to include character-level start/end positions.
-        
-        Returns:
-            Classification results keyed by task name.
-            If include_confidence=True, results include confidence scores.
-            If format_results=False, returns raw extraction data.
-        """
-        # Convert tasks to API format
-        # For classify_text task, schema should be {"categories": [...]}
-        # But for multi-task, we need to use the schema task
+        """Classify text into categories."""
         if len(tasks) == 1:
-            # Single task - use classify_text endpoint
-            task_name = list(tasks.keys())[0]
+            task_name = next(iter(tasks))
             task_config = tasks[task_name]
-            
-            if isinstance(task_config, dict) and "labels" in task_config:
-                categories = task_config["labels"]
-            else:
-                categories = task_config
-            
-            result = self._make_request(
-                task="classify_text",
-                text=text,
-                schema={"categories": categories},
-                threshold=threshold,
-                include_confidence=include_confidence,
-                include_spans=include_spans,
-                format_results=format_results,
+            categories = task_config["labels"] if (
+                isinstance(task_config, dict) and "labels" in task_config
+            ) else task_config
+            result = self._task_call(
+                "classify_text", text, {"categories": categories},
+                threshold, format_results, include_confidence, include_spans,
             )
-            
-            # Wrap result with task name (only for formatted results)
             if format_results and isinstance(result, dict) and task_name not in result:
                 return {task_name: result.get("classification", result)}
             return result
-        else:
-            # Multiple tasks - use schema endpoint
-            schema = {"classifications": tasks}
-            result = self._make_request(
-                task="schema",
-                text=text,
-                schema=schema,
-                threshold=threshold,
-                include_confidence=include_confidence,
-                include_spans=include_spans,
-                format_results=format_results,
-            )
-            return result
-    
+        return self._task_call(
+            "schema", text, {"classifications": tasks},
+            threshold, format_results, include_confidence, include_spans,
+        )
+
     def batch_classify_text(
         self,
         texts: List[str],
@@ -671,43 +592,14 @@ class GLiNER2API:
         include_confidence: bool = False,
         include_spans: bool = False
     ) -> List[Dict[str, Any]]:
-        """
-        Batch classify multiple texts.
-        
-        Args:
-            texts: List of texts to classify.
-            tasks: Classification tasks.
-            batch_size: Batch size.
-            threshold: Confidence threshold.
-            format_results: Whether to format results. If False, returns raw extraction data.
-            include_confidence: Whether to include confidence scores.
-            include_spans: Whether to include character-level start/end positions.
-        
-        Returns:
-            List of classification results.
-            If include_confidence=True, results include confidence scores.
-            If format_results=False, returns raw extraction data.
-        """
-        # Use schema task for batch classification
-        schema = {"classifications": tasks}
-        result = self._make_request(
-            task="schema",
-            text=texts,
-            schema=schema,
-            threshold=threshold,
-            include_confidence=include_confidence,
-            include_spans=include_spans,
-            format_results=format_results,
-        )
-        
-        if isinstance(result, dict):
-            return [result]
-        return result
-    
-    # -------------------------------------------------------------------------
-    # JSON Extraction Methods
-    # -------------------------------------------------------------------------
-    
+        """Batch classify multiple texts."""
+        return self._as_batch(self._task_call(
+            "schema", texts, {"classifications": tasks},
+            threshold, format_results, include_confidence, include_spans,
+        ))
+
+    # JSON Extraction Methods -------------------------------------------------
+
     def extract_json(
         self,
         text: str,
@@ -717,34 +609,12 @@ class GLiNER2API:
         include_confidence: bool = False,
         include_spans: bool = False
     ) -> Dict[str, Any]:
-        """
-        Extract structured data from text.
-        
-        Args:
-            text: Text to extract data from.
-            structures: Structure definitions with field specs.
-            threshold: Minimum confidence threshold.
-            format_results: Whether to format results. If False, returns raw extraction data.
-            include_confidence: Whether to include confidence scores.
-            include_spans: Whether to include character-level start/end positions.
-        
-        Returns:
-            Extracted structures keyed by structure name.
-            If include_confidence=True, field values include confidence scores.
-            If include_spans=True, field values include start/end positions.
-            If format_results=False, returns raw extraction data with positions.
-        """
-        result = self._make_request(
-            task="extract_json",
-            text=text,
-            schema=structures,
-            threshold=threshold,
-            include_confidence=include_confidence,
-            include_spans=include_spans,
-            format_results=format_results,
+        """Extract structured data from text."""
+        return self._task_call(
+            "extract_json", text, structures,
+            threshold, format_results, include_confidence, include_spans,
         )
-        return result
-    
+
     def batch_extract_json(
         self,
         texts: List[str],
@@ -755,42 +625,14 @@ class GLiNER2API:
         include_confidence: bool = False,
         include_spans: bool = False
     ) -> List[Dict[str, Any]]:
-        """
-        Batch extract structured data from multiple texts.
-        
-        Args:
-            texts: List of texts.
-            structures: Structure definitions.
-            batch_size: Batch size.
-            threshold: Confidence threshold.
-            format_results: Whether to format results. If False, returns raw extraction data.
-            include_confidence: Whether to include confidence scores.
-            include_spans: Whether to include character-level start/end positions.
-        
-        Returns:
-            List of extracted structures.
-            If include_confidence=True, field values include confidence scores.
-            If include_spans=True, field values include start/end positions.
-            If format_results=False, returns raw extraction data with positions.
-        """
-        result = self._make_request(
-            task="extract_json",
-            text=texts,
-            schema=structures,
-            threshold=threshold,
-            include_confidence=include_confidence,
-            include_spans=include_spans,
-            format_results=format_results,
-        )
-        
-        if isinstance(result, dict):
-            return [result]
-        return result
-    
-    # -------------------------------------------------------------------------
-    # Relation Extraction Methods
-    # -------------------------------------------------------------------------
-    
+        """Batch extract structured data from multiple texts."""
+        return self._as_batch(self._task_call(
+            "extract_json", texts, structures,
+            threshold, format_results, include_confidence, include_spans,
+        ))
+
+    # Relation Extraction Methods --------------------------------------------
+
     def extract_relations(
         self,
         text: str,
@@ -800,41 +642,13 @@ class GLiNER2API:
         include_confidence: bool = False,
         include_spans: bool = False
     ) -> Dict[str, Any]:
-        """
-        Extract relations between entities from text.
-        
-        Args:
-            text: Input text to extract relations from.
-            relation_types: Relation types to extract. Can be:
-                - str: Single relation type
-                - List[str]: Multiple relation types
-                - Dict[str, str]: Relation types with descriptions
-                - Dict[str, Dict]: Relation types with full configuration
-            threshold: Minimum confidence threshold.
-            format_results: Whether to format results. If False, returns raw extraction data.
-            include_confidence: Whether to include confidence scores in results.
-            include_spans: Whether to include character-level start/end positions.
-        
-        Returns:
-            Dictionary with "relation_extraction" key containing extracted relations.
-            Relations are grouped by type with tuples (source, target).
-            Format: {"relation_extraction": {"relation_name": [("source", "target"), ...]}}
-        """
-        # Build schema with relations
+        """Extract relations between entities from text."""
         schema = self.create_schema().relations(relation_types).build()
-        
-        result = self._make_request(
-            task="schema",
-            text=text,
-            schema=schema,
-            threshold=threshold,
-            include_confidence=include_confidence,
-            include_spans=include_spans,
-            format_results=format_results,
+        return self._task_call(
+            "schema", text, schema,
+            threshold, format_results, include_confidence, include_spans,
         )
-        
-        return result
-    
+
     def batch_extract_relations(
         self,
         texts: List[str],
@@ -845,44 +659,20 @@ class GLiNER2API:
         include_confidence: bool = False,
         include_spans: bool = False
     ) -> List[Dict[str, Any]]:
-        """
-        Batch extract relations from multiple texts.
-        
-        Args:
-            texts: List of input texts.
-            relation_types: Relation types to extract.
-            batch_size: Batch size (used by API for optimization).
-            threshold: Minimum confidence threshold.
-            format_results: Whether to format results.
-            include_confidence: Whether to include confidence scores.
-            include_spans: Whether to include character-level start/end positions.
-        
-        Returns:
-            List of dictionaries with "relation_extraction" key.
-            Format: [{"relation_extraction": {"relation_name": [("source", "target"), ...]}}]
-        """
-        # Build schema with relations
+        """Batch extract relations from multiple texts."""
         schema = self.create_schema().relations(relation_types).build()
-        
-        result = self._make_request(
-            task="schema",
-            text=texts,
-            schema=schema,
-            threshold=threshold,
-            include_confidence=include_confidence,
-            include_spans=include_spans,
-            format_results=format_results,
-        )
-        
-        # Ensure result is a list
-        if isinstance(result, dict):
-            return [result]
-        return result
-    
-    # -------------------------------------------------------------------------
-    # General Extraction Methods
-    # -------------------------------------------------------------------------
-    
+        return self._as_batch(self._task_call(
+            "schema", texts, schema,
+            threshold, format_results, include_confidence, include_spans,
+        ))
+
+    # General Extraction Methods ---------------------------------------------
+
+    @staticmethod
+    def _schema_dict(schema):
+        """Accept the established builder protocol or a plain dict."""
+        return schema.build() if hasattr(schema, "build") else schema
+
     def extract(
         self,
         text: str,
@@ -892,50 +682,17 @@ class GLiNER2API:
         include_confidence: bool = False,
         include_spans: bool = False
     ) -> Dict[str, Any]:
-        """
-        Extract information from text using a schema.
-        
-        Args:
-            text: Input text to extract from.
-            schema: Schema defining what to extract.
-            threshold: Minimum confidence threshold.
-            format_results: Whether to format results. If False, returns raw extraction data.
-            include_confidence: Whether to include confidence scores.
-            include_spans: Whether to include character-level start/end positions.
-        
-        Returns:
-            Extraction results organized by task name.
-            If include_confidence=True, values include confidence scores.
-            If include_spans=True, values include start/end positions.
-            If format_results=False, returns raw extraction data with positions.
-        """
-        # Build schema dict if needed
-        if isinstance(schema, SchemaAPI):
-            schema_dict = schema.build()
-        elif hasattr(schema, 'build'):
-            schema_dict = schema.build()
-        else:
-            schema_dict = schema
-        
-        # Validate schema has at least one extraction task
-        has_any_task = any(
-            key in schema_dict 
-            for key in ["entities", "classifications", "structures", "relations"]
-        )
-        if not has_any_task:
+        """Extract information from text using a schema."""
+        schema_dict = self._schema_dict(schema)
+        if not any(key in schema_dict for key in [
+            "entities", "classifications", "structures", "relations"
+        ]):
             raise ValueError("Schema must contain at least one extraction task")
-        
-        # Always use schema task to preserve all metadata (thresholds, dtypes, etc.)
-        return self._make_request(
-            task="schema",
-            text=text,
-            schema=schema_dict,
-            threshold=threshold,
-            include_confidence=include_confidence,
-            include_spans=include_spans,
-            format_results=format_results,
+        return self._task_call(
+            "schema", text, schema_dict,
+            threshold, format_results, include_confidence, include_spans,
         )
-    
+
     def batch_extract(
         self,
         texts: List[str],
@@ -946,65 +703,35 @@ class GLiNER2API:
         include_confidence: bool = False,
         include_spans: bool = False
     ) -> List[Dict[str, Any]]:
-        """
-        Extract information from multiple texts.
-        
-        Args:
-            texts: List of input texts.
-            schemas: Single schema for all texts or list of schemas.
-            batch_size: Batch size.
-            threshold: Confidence threshold.
-            format_results: Whether to format results. If False, returns raw extraction data.
-            include_confidence: Whether to include confidence scores.
-            include_spans: Whether to include character-level start/end positions.
-        
-        Returns:
-            List of extraction results.
-            If include_confidence=True, values include confidence scores.
-            If include_spans=True, values include start/end positions.
-            If format_results=False, returns raw extraction data with positions.
-        """
+        """Extract information from multiple texts."""
         if not texts:
             return []
-        
-        # Handle schema variations
         if isinstance(schemas, list):
             if len(schemas) != len(texts):
                 raise ValueError(
                     f"Number of schemas ({len(schemas)}) must match number of texts ({len(texts)})"
                 )
-            # Warn user about multi-schema batch limitation
             warnings.warn(
                 "Multi-schema batch (different schemas per text) is not natively supported by the API. "
                 "Each text will be processed individually, which may be slower than single-schema batch. "
                 "For better performance, use the same schema for all texts.",
                 UserWarning,
-                stacklevel=2
+                stacklevel=2,
             )
-            # Process each text with its schema individually
-            results = []
-            for text, schema in zip(texts, schemas):
-                results.append(self.extract(text, schema, threshold, include_confidence=include_confidence, include_spans=include_spans, format_results=format_results))
-            return results
-        
-        # Single schema for all texts
-        if isinstance(schemas, SchemaAPI):
-            schema_dict = schemas.build()
-        elif hasattr(schemas, 'build'):
-            schema_dict = schemas.build()
-        else:
-            schema_dict = schemas
-        
-        return self._make_request(
-            task="schema",
-            text=texts,
-            schema=schema_dict,
-            threshold=threshold,
-            include_confidence=include_confidence,
-            include_spans=include_spans,
-            format_results=format_results,
+            return [
+                self.extract(
+                    text, schema, threshold,
+                    include_confidence=include_confidence,
+                    include_spans=include_spans,
+                    format_results=format_results,
+                )
+                for text, schema in zip(texts, schemas)
+            ]
+        return self._task_call(
+            "schema", texts, self._schema_dict(schemas),
+            threshold, format_results, include_confidence, include_spans,
         )
-    
+
     # -------------------------------------------------------------------------
     # Utility Methods
     # -------------------------------------------------------------------------

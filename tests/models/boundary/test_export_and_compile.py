@@ -76,3 +76,13 @@ def test_boundary_proposer_torch_compile_two_lengths():
 
     # Same compiled callable handles both lengths; candidate budget is fixed.
     assert out_short.indices.shape[2] == out_long.indices.shape[2] == 8
+
+
+@pytest.mark.compile
+def test_vectorized_proposer_has_zero_dynamo_graph_breaks():
+    if not hasattr(torch, "_dynamo"):
+        pytest.skip("torch._dynamo is unavailable")
+    proposer = SparseBoundaryProposer(8, 8, _settings("vectorized")).eval()
+    explanation = torch._dynamo.explain(proposer)(*_inputs())
+    assert explanation.graph_count == 1
+    assert explanation.graph_break_count == 0, explanation.break_reasons
