@@ -358,6 +358,7 @@ class SchemaTransformer:
             architecture: str = "span",
             max_gold_per_query: int = 32,
             on_capacity_exceeded: str = "raise",
+            ignore_missing_entities: bool = False,
     ) -> PreprocessedBatch:
         """
         Collate function for training DataLoader.
@@ -390,6 +391,7 @@ class SchemaTransformer:
             result, architecture, is_training=True,
             max_gold_per_query=max_gold_per_query,
             on_capacity_exceeded=on_capacity_exceeded,
+            ignore_missing_entities=ignore_missing_entities,
         )
 
     def collate_fn_inference(
@@ -402,6 +404,7 @@ class SchemaTransformer:
             build_targets: Optional[bool] = None,
             max_gold_per_query: int = 32,
             on_capacity_exceeded: str = "raise",
+            ignore_missing_entities: bool = False,
     ) -> PreprocessedBatch:
         """
         Collate function for inference DataLoader.
@@ -428,6 +431,7 @@ class SchemaTransformer:
             result, architecture, is_training=False,
             build_targets=build_targets, max_gold_per_query=max_gold_per_query,
             on_capacity_exceeded=on_capacity_exceeded,
+            ignore_missing_entities=ignore_missing_entities,
         )
 
     @staticmethod
@@ -439,6 +443,7 @@ class SchemaTransformer:
             max_gold_per_query: int = 32,
             build_targets: Optional[bool] = None,
             on_capacity_exceeded: str = "raise",
+            ignore_missing_entities: bool = False,
     ) -> PreprocessedBatch:
         if architecture != "boundary" or len(batch) == 0:
             return batch
@@ -462,6 +467,7 @@ class SchemaTransformer:
             record_metadata_list=record_metadata_list if has_records else None,
             build_targets=build_targets,
             on_capacity_exceeded=on_capacity_exceeded,
+            ignore_missing_entities=ignore_missing_entities,
         )
         batch.query_layouts = layouts
         batch.targets = targets
@@ -1249,6 +1255,20 @@ class SchemaTransformer:
         combined.append(self.SEP_TEXT)
         combined.extend(text_tokens)
 
+        # Route only the structural marker slots in each schema. Prompt text,
+        # label descriptions, and few-shot examples may themselves tokenize to
+        # special-token IDs; treating those as child markers creates more
+        # classification logits than labels.
+        schema_marker_orig_indices = set()
+        offset = 0
+        for struct in schema_tokens_list:
+            if len(struct) > 1:
+                schema_marker_orig_indices.add(offset + 1)  # [P]
+            schema_marker_orig_indices.update(
+                offset + index for index in range(4, len(struct) - 2, 2)
+            )
+            offset += len(struct) + 1  # Schema tokens plus [SEP_STRUCT].
+
         # Build subword list, mappings, and routing indices
         subwords = []
         mappings = []
@@ -1305,8 +1325,7 @@ class SchemaTransformer:
                 text_word_first_positions.append(subword_pos)
             elif seg_type == "schema":
                 # Track special token positions for schema embeddings
-                tid = self.tokenizer.convert_tokens_to_ids(sub_tokens[0]) if sub_tokens else None
-                if tid is not None and tid in self._special_ids:
+                if orig_idx in schema_marker_orig_indices:
                     schema_special_positions[schema_idx].append(subword_pos)
 
         input_ids = self.tokenizer.convert_tokens_to_ids(subwords)

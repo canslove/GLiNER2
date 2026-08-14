@@ -224,6 +224,33 @@ def make_candidates(
     )
 
 
+def test_record_head_masks_out_of_range_field_query_ids():
+    hidden = 24
+    candidates = make_candidates([[(0, 1), (2, 3)]], hidden)
+    spec = RecordSpec(
+        task_index=0,
+        task_name="event",
+        task_type="json_structures",
+        mode="natural",
+        fields=(
+            RecordFieldSpec(
+                7, "anchor", 0, FieldCardinality.REQUIRED_ONE, is_anchor=True
+            ),
+        ),
+        anchor_query_id=7,
+    )
+    head = RecordHead(hidden, record_dim=hidden, instance_queries=4)
+    group = head.forward_group_dense(
+        spec,
+        torch.randn(1, hidden),
+        candidates,
+        sample_index=0,
+    )
+    assert not group.instance_mask.any()
+    assert not group.field_membership.any()
+    assert torch.isfinite(group.assign_logits).all()
+
+
 def test_natural_mode_overfits_two_records_and_derives_count():
     torch.manual_seed(0)
     hidden = 24

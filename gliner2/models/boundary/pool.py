@@ -174,8 +174,8 @@ class DocumentCandidatePool(nn.Module):
         compat = (selected_start * selected_end).sum(-1) / math.sqrt(d)
         union_pair_score = (
             compat
-            + union_start.gather(1, pair_s)
-            + union_end.gather(1, pair_e)
+            + union_start.gather(1, pair_s.clamp(0, n - 1))
+            + union_end.gather(1, pair_e.clamp(0, n - 1))
         )
 
         # Reserve each active query's strongest pairs before global fill. The
@@ -185,8 +185,8 @@ class DocumentCandidatePool(nn.Module):
         quota_scores = union_pair_score.new_zeros((b, 0))
         quota_valid = pair_valid.new_zeros((b, 0))
         if quota:
-            s_idx = pair_s.unsqueeze(1).expand(b, q, -1)
-            e_idx = pair_e.unsqueeze(1).expand(b, q, -1)
+            s_idx = pair_s.clamp(0, start_logits.shape[2] - 1).unsqueeze(1).expand(b, q, -1)
+            e_idx = pair_e.clamp(0, end_logits.shape[2] - 1).unsqueeze(1).expand(b, q, -1)
             per_query = (
                 start_logits.gather(2, s_idx)
                 + end_logits.gather(2, e_idx)
@@ -227,6 +227,8 @@ class DocumentCandidatePool(nn.Module):
 
         if gold_pairs is not None and gold_mask is not None:
             gvalid = gold_mask & query_mask.unsqueeze(-1)
+            oob = (gold_pairs[..., 0] >= n) | (gold_pairs[..., 1] >= n) | (gold_pairs < 0).any(-1)
+            gvalid = gvalid & ~oob
             if gold_injection_prob <= 0.0:
                 gvalid = torch.zeros_like(gvalid)
             elif gold_injection_prob < 1.0:
@@ -234,7 +236,8 @@ class DocumentCandidatePool(nn.Module):
                     gvalid.shape, device=gvalid.device, generator=generator
                 )
                 gvalid = gvalid & (sampled < gold_injection_prob)
-            gkeys = gold_pairs[..., 0] * n + gold_pairs[..., 1]
+            safe_gold = gold_pairs.clamp(0, n - 1)
+            gkeys = safe_gold[..., 0] * n + safe_gold[..., 1]
             all_keys = torch.cat((all_keys, gkeys.reshape(b, -1)), -1)
             all_valid = torch.cat((all_valid, gvalid.reshape(b, -1)), -1)
             gold_priority = union_pair_score.new_full(
@@ -262,8 +265,8 @@ class DocumentCandidatePool(nn.Module):
         selected_compat = (gs * ge).sum(-1) / math.sqrt(d)
         selected_score = (
             selected_compat
-            + union_start.gather(1, selected_s)
-            + union_end.gather(1, selected_e)
+            + union_start.gather(1, selected_s.clamp(0, n - 1))
+            + union_end.gather(1, selected_e.clamp(0, n - 1))
         )
         selected_score = selected_score.masked_fill(~selected_valid, MASK_LOGIT)
         selected_compat = torch.where(
@@ -563,13 +566,14 @@ class SharedPoolScorer(nn.Module):
         score = score + self.film_output(conditioned).squeeze(-1)
 
         c = starts.shape[1]
-        s_idx = starts.unsqueeze(1).expand(-1, query_states.shape[1], c)
-        e_idx = ends.unsqueeze(1).expand_as(s_idx)
+        s_idx = starts.clamp(0, start_logits.shape[2] - 1).unsqueeze(1).expand(-1, query_states.shape[1], c)
+        e_idx = ends.clamp(0, end_logits.shape[2] - 1).unsqueeze(1).expand_as(s_idx)
         score = score + start_logits.gather(2, s_idx).transpose(1, 2)
         score = score + end_logits.gather(2, e_idx).transpose(1, 2)
         if inside_prefix is not None:
             interval = (
-                inside_prefix.gather(2, e_idx) - inside_prefix.gather(2, s_idx)
+                inside_prefix.gather(2, e_idx.clamp(max=inside_prefix.shape[2] - 1))
+                - inside_prefix.gather(2, s_idx.clamp(max=inside_prefix.shape[2] - 1))
             )
             if inside_prefix_mean is not None:
                 interval = interval + inside_prefix_mean * (

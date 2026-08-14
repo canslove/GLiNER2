@@ -387,6 +387,14 @@ example = InputExample(
 )
 ```
 
+When these structures are saved as JSONL and trained with the boundary
+architecture, they automatically use `natural` record formation. The first
+declared field is the anchor, so legacy data needs no `record_metadata` block.
+For example, `product` is the anchor in the `order` structure above. Field
+names such as `mode`, `anchor`, and `occurrence_policy` remain valid ordinary
+JSON structure fields; record-specific overrides belong in the separate
+`output.record_metadata` mapping.
+
 #### Relation Extraction
 
 ```python

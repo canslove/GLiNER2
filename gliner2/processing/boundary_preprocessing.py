@@ -330,6 +330,7 @@ def build_boundary_batch_metadata(
     field_dtypes_list: Optional[Sequence[Optional[Mapping[str, Any]]]] = None,
     build_targets: Optional[bool] = None,
     on_capacity_exceeded: str = "raise",
+    ignore_missing_entities: bool = False,
 ) -> tuple:
     """Build layouts, optional padded targets, and compiled record specs.
 
@@ -411,7 +412,11 @@ def build_boundary_batch_metadata(
                             continue
                         for hs, he in _iter_inclusive_spans(instance[0]):
                             for ts, te in _iter_inclusive_spans(instance[1]):
-                                gold_pairs.append((hs, he + 1, ts, te + 1))
+                                if (
+                                    0 <= hs <= he < text_length
+                                    and 0 <= ts <= te < text_length
+                                ):
+                                    gold_pairs.append((hs, he + 1, ts, te + 1))
                 sample_relation_gold.append(gold_pairs)
 
             if not build_targets or not labels or labels[0] == 0:
@@ -428,6 +433,8 @@ def build_boundary_batch_metadata(
                         # must raise under strict training (never silently drop).
                         for start, end_inclusive in positions:
                             if (start, end_inclusive) == (-1, -1):
+                                if ignore_missing_entities:
+                                    continue
                                 raise ValueError(
                                     f"entity {fields[field_index]!r} was not found "
                                     f"in sample {sample_idx}"

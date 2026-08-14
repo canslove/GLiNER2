@@ -60,7 +60,7 @@ class BoundaryHeadSettings:
     # the marginal objective: standard weighted BCE or asymmetric focal loss.
     boundary_negative_weight: float = 1.0
     boundary_marginal_loss: str = "bce"  # "bce" | "asymmetric_focal"
-    loss_reduction: str = "global"  # "global" | "per_query"
+    loss_reduction: str = "global"  # "global" | "per_query" | "sum"
     boundary_focal_gamma_positive: float = 0.0
     boundary_focal_gamma_negative: float = 2.0
     boundary_focal_clip: float = 0.05
@@ -422,9 +422,10 @@ def validate_boundary_head(values: Mapping[str, Any]) -> dict:
             "boundary_head.boundary_marginal_loss must be 'bce' or "
             f"'asymmetric_focal', got {result['boundary_marginal_loss']!r}"
         )
-    if result["loss_reduction"] not in ("global", "per_query"):
+    if result["loss_reduction"] not in ("global", "per_query", "sum"):
         raise ValueError(
-            "boundary_head.loss_reduction must be 'global' or 'per_query', got "
+            "boundary_head.loss_reduction must be 'global', 'per_query', or "
+            f"'sum', got "
             f"{result['loss_reduction']!r}"
         )
     if (

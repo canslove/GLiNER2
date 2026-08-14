@@ -43,6 +43,9 @@ def interval_prefix_score(
 
     ``prefix`` is ``[B, Q, L+1]``. Returns ``[B, Q, C]``.
     """
+    max_idx = prefix.shape[2] - 1
+    starts = starts.clamp(0, max_idx)
+    ends = ends.clamp(0, max_idx)
     p_end = torch.gather(prefix, 2, ends)
     p_start = torch.gather(prefix, 2, starts)
     interval = p_end - p_start
@@ -217,8 +220,10 @@ class SparseBoundaryPairScorer(nn.Module):
             compat = compat + self.endpoint_difference_projection(difference).squeeze(-1)
 
         # Start/end marginals gathered at the candidate boundaries (added once).
-        a = torch.gather(start_logits, 2, starts)
-        bmarg = torch.gather(end_logits, 2, ends)
+        max_s = start_logits.shape[2] - 1
+        max_e = end_logits.shape[2] - 1
+        a = torch.gather(start_logits, 2, starts.clamp(0, max_s))
+        bmarg = torch.gather(end_logits, 2, ends.clamp(0, max_e))
 
         # Prior is the proposer's marginal-free compatibility so marginals are
         # not double-counted. Fall back to the (masked) full prior only if a

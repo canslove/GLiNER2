@@ -366,6 +366,8 @@ def assemble_candidates(
 
     if gold_pairs is not None and gold_mask is not None:
         gvalid = gold_mask & query_mask.unsqueeze(-1)
+        oob = (gold_pairs[..., 0] >= n_boundaries) | (gold_pairs[..., 1] >= n_boundaries) | (gold_pairs < 0).any(-1)
+        gvalid = gvalid & ~oob
         if gold_injection_prob <= 0.0:
             gvalid = torch.zeros_like(gvalid)
         elif gold_injection_prob < 1.0:
@@ -373,7 +375,8 @@ def assemble_candidates(
                 gvalid.shape, device=gvalid.device, generator=generator
             )
             gvalid = gvalid & (sampled < gold_injection_prob)
-        gkeys = gold_pairs[..., 0] * n_boundaries + gold_pairs[..., 1]
+        safe_gold = gold_pairs.clamp(0, n_boundaries - 1)
+        gkeys = safe_gold[..., 0] * n_boundaries + safe_gold[..., 1]
         gkeys = torch.where(
             gvalid, gkeys, torch.full_like(gkeys, invalid_key)
         )
@@ -538,7 +541,7 @@ class SparseBoundaryProposer(nn.Module):
             st_valid.unsqueeze(-1)
             & query_mask.view(b, q, 1, 1)
             & boundary_mask.gather(
-                1, fwd_end_idx.reshape(b, -1)
+                1, fwd_end_idx.reshape(b, -1).clamp(0, boundary_mask.shape[1] - 1)
             ).view_as(fwd_end_idx)
             & (fwd_end_idx > fwd_start)
         ).reshape(b, q, -1)
@@ -571,7 +574,7 @@ class SparseBoundaryProposer(nn.Module):
                     en_valid.unsqueeze(-1)
                     & query_mask.view(b, q, 1, 1)
                     & boundary_mask.gather(
-                        1, bwd_start_idx.reshape(b, -1)
+                        1, bwd_start_idx.reshape(b, -1).clamp(0, boundary_mask.shape[1] - 1)
                     ).view_as(bwd_start_idx)
                     & (bwd_end > bwd_start_idx)
                 ).reshape(b, q, -1)
@@ -625,8 +628,8 @@ class SparseBoundaryProposer(nn.Module):
         compat = (g_s * g_e).sum(-1) * scale                            # [B,Q,C]
         out_logits = None
         if self.training or return_proposal_logits:
-            sm = torch.gather(start_logits, 2, si)
-            em = torch.gather(end_logits, 2, ej)
+            sm = torch.gather(start_logits, 2, si.clamp(0, start_logits.shape[2] - 1))
+            em = torch.gather(end_logits, 2, ej.clamp(0, end_logits.shape[2] - 1))
             logits_diff = compat + sm + em
             neg_inf_like = torch.full_like(logits_diff, MASK_LOGIT)
             out_logits = torch.where(out_valid, logits_diff, neg_inf_like)
