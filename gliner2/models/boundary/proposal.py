@@ -443,6 +443,61 @@ class SparseBoundaryProposer(nn.Module):
             if settings.enable_rotary_endpoints else None
         )
 
+    def score_explicit_pairs(
+        self,
+        boundary_states: torch.Tensor,
+        query_states: torch.Tensor,
+        indices: torch.LongTensor,
+        valid_mask: torch.BoolTensor,
+    ) -> torch.Tensor:
+        """Return the marginal-free proposal prior for explicit span pairs.
+
+        This is the differentiable compatibility term used for candidates
+        selected by :meth:`forward`, evaluated at caller-provided half-open
+        ``[start, end)`` coordinates.  It lets downstream decoders force-score
+        a retained span for another query without depending on that query's
+        sparse top-k proposal set.
+        """
+        if indices.dim() != 4 or indices.shape[-1] != 2:
+            raise ValueError(
+                f"indices must be [B, Q, C, 2], got {tuple(indices.shape)}"
+            )
+        if valid_mask.shape != indices.shape[:-1]:
+            raise ValueError(
+                "valid_mask must match indices [B, Q, C], got "
+                f"{tuple(valid_mask.shape)} and {tuple(indices.shape)}"
+            )
+        if (
+            indices.shape[0] != boundary_states.shape[0]
+            or indices.shape[0] != query_states.shape[0]
+            or indices.shape[1] != query_states.shape[1]
+        ):
+            raise ValueError("explicit pair batch/query dimensions do not match states")
+
+        start_all = self.start_pair_projection(boundary_states)
+        end_all = self.end_key_projection(boundary_states)
+        if self.rotary is not None:
+            positions = torch.arange(
+                boundary_states.shape[1], device=boundary_states.device
+            ).view(1, -1)
+            start_all = self.rotary(start_all, positions)
+            end_all = self.rotary(end_all, positions)
+        gate = torch.sigmoid(self.start_query_projection(query_states))
+        if self.rotary is not None:
+            gate = gate.repeat_interleave(2, dim=-1)
+
+        starts = indices[..., 0].clamp(0, boundary_states.shape[1] - 1)
+        ends = indices[..., 1].clamp(0, boundary_states.shape[1] - 1)
+        start_states = gather_states(start_all, starts) * gate.unsqueeze(2)
+        end_states = gather_states(end_all, ends)
+        compatibility = (
+            (start_states * end_states).sum(-1)
+            / math.sqrt(self.boundary_dim)
+        )
+        return torch.where(
+            valid_mask, compatibility, torch.zeros_like(compatibility)
+        )
+
     def forward(
         self,
         boundary_states: torch.Tensor,   # [B, L+1, d]

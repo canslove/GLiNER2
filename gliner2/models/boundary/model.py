@@ -13,20 +13,34 @@ Half-open ``[start, end)`` coordinates throughout; there is no width axis.
 
 from __future__ import annotations
 
-import math
+import logging
 import os
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+import tempfile
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
-from transformers import AutoConfig, AutoModel, AutoTokenizer
+from transformers import AutoConfig
+
+if TYPE_CHECKING:
+    from peft import PeftModel
 
 from gliner2.configuration import BoundaryHeadSettings, ExtractorConfig
 from gliner2.layers import create_mlp
-from gliner2.models.base import BaseExtractorModel, EncodedBatch
+from gliner2.models.base import (
+    BaseExtractorModel,
+    EncodedBatch,
+    load_extractor_tokenizer,
+)
+from gliner2.models.loading import (
+    apply_post_load_options,
+    checkpoint_file,
+    load_checkpoint_state_dict,
+    reconcile_encoder_embeddings,
+    split_load_kwargs,
+)
 from gliner2.models.boundary.encoding import BoundaryEncoder
 from gliner2.models.boundary.constants import MASK_LOGIT
 from gliner2.models.boundary.heads import BoundaryMarginals, BoundaryQueryHead
@@ -79,6 +93,7 @@ from gliner2.utils.device_errors import is_fatal_device_error
 
 
 DEFAULT_LOSS_WEIGHTS = {"start": 1.0, "end": 1.0, "pair": 1.0, "inside": 0.5}
+logger = logging.getLogger(__name__)
 
 
 def _finite_loss_term(value: torch.Tensor) -> torch.Tensor:
@@ -255,6 +270,86 @@ class BoundaryHead(nn.Module):
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"soft IoU scale must be in [0, 1], got {value}")
         self._soft_iou_scale = float(value)
+
+    def score_explicit_spans(
+        self,
+        token_states: torch.Tensor,
+        text_mask: torch.BoolTensor,
+        query_states: torch.Tensor,
+        query_mask: torch.BoolTensor,
+        indices: torch.LongTensor,
+        valid_mask: Optional[torch.BoolTensor] = None,
+    ) -> torch.Tensor:
+        """Score caller-provided half-open spans for every query.
+
+        ``indices`` is ``[B, Q, C, 2]``.  Unlike normal inference, this path
+        bypasses sparse proposal selection while retaining the exact proposal
+        compatibility prior and pair-reranker computation used by ordinary
+        candidates.  It is intended for span-conditioned features such as
+        entity attributes and constrained structure fields.
+        """
+        if indices.dim() != 4 or indices.shape[-1] != 2:
+            raise ValueError(
+                f"indices must be [B, Q, C, 2], got {tuple(indices.shape)}"
+            )
+        b, q, _, _ = indices.shape
+        if (
+            b != token_states.shape[0]
+            or b != query_states.shape[0]
+            or q != query_states.shape[1]
+        ):
+            raise ValueError("explicit span batch/query dimensions do not match states")
+
+        text_lengths = text_mask.sum(dim=1).long()
+        starts = indices[..., 0]
+        ends = indices[..., 1]
+        legal = (
+            (starts >= 0)
+            & (ends > starts)
+            & (ends <= text_lengths.view(b, 1, 1))
+            & query_mask.unsqueeze(-1)
+        )
+        if valid_mask is not None:
+            if valid_mask.shape != indices.shape[:-1]:
+                raise ValueError(
+                    "valid_mask must match indices [B, Q, C], got "
+                    f"{tuple(valid_mask.shape)} and {tuple(indices.shape)}"
+                )
+            legal = legal & valid_mask
+
+        encoding = self.boundary_encoder(token_states, text_mask)
+        marginals = self.boundary_query_head(
+            encoding.states,
+            encoding.mask,
+            token_states,
+            text_mask,
+            query_states,
+            query_mask,
+        )
+        compatibility = self.boundary_proposer.score_explicit_pairs(
+            encoding.states, query_states, indices, legal
+        )
+        proposals = BoundaryProposals(
+            indices=indices,
+            logits=None,
+            valid_mask=legal,
+            compat_logits=compatibility,
+        )
+        inside_prefix = (
+            marginals.inside_prefix if self.use_inside_evidence else None
+        )
+        return self.pair_scorer(
+            encoding.states,
+            query_states,
+            proposals,
+            marginals.start_logits,
+            marginals.end_logits,
+            inside_prefix,
+            text_lengths,
+            token_states,
+            text_mask,
+            inside_prefix_mean=marginals.inside_prefix_mean,
+        )
 
     def forward(
         self,
@@ -854,7 +949,7 @@ class BoundaryHead(nn.Module):
 def _group_scored_candidates(
     candidates: CandidateTensorBatch,
     *,
-    threshold: float = 0.5,
+    threshold: Union[float, torch.Tensor] = 0.5,
     probabilities: Optional[torch.Tensor] = None,
     count_log_rates: Optional[torch.Tensor] = None,
     adaptive_threshold: bool = False,
@@ -866,7 +961,17 @@ def _group_scored_candidates(
         if probabilities is None else probabilities
     )
     eligible = candidates.valid_mask & candidates.query_mask.unsqueeze(-1)
-    keep = eligible & (probs >= threshold)
+    threshold_value = threshold
+    if isinstance(threshold, torch.Tensor):
+        if threshold.shape != probs.shape[:2]:
+            raise ValueError(
+                "tensor threshold must be [B, Q], got "
+                f"{tuple(threshold.shape)} for probabilities {tuple(probs.shape)}"
+            )
+        threshold_value = threshold.to(
+            device=probs.device, dtype=probs.dtype
+        ).unsqueeze(-1)
+    keep = eligible & (probs >= threshold_value)
     if adaptive_threshold:
         if count_log_rates is None:
             raise ValueError(
@@ -1009,7 +1114,13 @@ class BoundaryExtractorModel(BaseExtractorModel):
                 total = total + parameter.sum() * 0.0
         return total
 
-    def __init__(self, config: ExtractorConfig, encoder_config=None, tokenizer=None):
+    def __init__(
+        self,
+        config: ExtractorConfig,
+        encoder_config=None,
+        tokenizer=None,
+        use_flashdeberta: Optional[bool] = None,
+    ):
         super().__init__(config)
         if config.architecture != "boundary":
             raise ValueError(
@@ -1028,6 +1139,7 @@ class BoundaryExtractorModel(BaseExtractorModel):
             config.model_name,
             encoder_config,
             getattr(config, "attn_implementation", "sdpa"),
+            use_flashdeberta=use_flashdeberta,
         )
         self.encoder.resize_token_embeddings(len(self.processor.tokenizer))
         self.hidden_size = self.encoder.config.hidden_size
@@ -1079,6 +1191,29 @@ class BoundaryExtractorModel(BaseExtractorModel):
         self._lora_layers = {}
         self._adapter_config = None
 
+    def quantize(self, method: str = "fp16") -> "BoundaryExtractorModel":
+        """Cast the complete boundary model for lower-precision inference.
+
+        Args:
+            method: ``"fp16"`` (span-parity default) or ``"bf16"``.
+        """
+        normalized = str(method).strip().lower()
+        aliases = {
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "half": torch.float16,
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+        }
+        if normalized not in aliases:
+            raise ValueError(
+                "quantize method must be 'fp16' or 'bf16', "
+                f"got {method!r}"
+            )
+        self.to(dtype=aliases[normalized])
+        logger.info("Converted boundary model to %s", normalized)
+        return self
+
     def compile(self, dynamic: bool = True) -> "BoundaryExtractorModel":
         """Compile the backbone and tensor-heavy boundary regions in place."""
         if not hasattr(torch, "compile"):
@@ -1104,6 +1239,36 @@ class BoundaryExtractorModel(BaseExtractorModel):
                 self.boundary_head.shared_pool_scorer, dynamic=dynamic
             )
         return self
+
+    def apply_lora(
+        self,
+        r: int = 8,
+        alpha: float = 16.0,
+        dropout: float = 0.0,
+        targets: Optional[List[str]] = None,
+        use_dora: bool = False,
+    ) -> "PeftModel":
+        """Apply PEFT LoRA adapters and return the wrapped boundary model."""
+        from peft import LoraConfig as PeftLoraConfig, get_peft_model
+        from gliner2.training.lora import _cast_lora_dtype, _resolve_targets
+
+        base_id = (
+            getattr(self, "name_or_path", "")
+            or getattr(self.config, "_name_or_path", "")
+            or None
+        )
+        peft_config = PeftLoraConfig(
+            r=r,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            target_modules=_resolve_targets(self, targets or ["encoder"]),
+            bias="none",
+            use_dora=use_dora,
+            base_model_name_or_path=base_id,
+        )
+        peft_model = get_peft_model(self, peft_config)
+        _cast_lora_dtype(peft_model)
+        return peft_model
 
     # =========================================================================
     # Encoding
@@ -1636,8 +1801,16 @@ class BoundaryExtractorModel(BaseExtractorModel):
             except RuntimeError as exc:
                 if is_fatal_device_error(exc):
                     raise
+                logger.warning(
+                    "Dropped record auxiliary loss after RuntimeError: %s", exc
+                )
                 record_loss = None
-            except (IndexError, ValueError):
+            except (IndexError, ValueError) as exc:
+                logger.warning(
+                    "Dropped record auxiliary loss after %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
                 record_loss = None
         relation_loss = None
         if self.enable_relations and self.training and output.candidates is not None:
@@ -1648,8 +1821,16 @@ class BoundaryExtractorModel(BaseExtractorModel):
             except RuntimeError as exc:
                 if is_fatal_device_error(exc):
                     raise
+                logger.warning(
+                    "Dropped relation auxiliary loss after RuntimeError: %s", exc
+                )
                 relation_loss = None
-            except (IndexError, ValueError):
+            except (IndexError, ValueError) as exc:
+                logger.warning(
+                    "Dropped relation auxiliary loss after %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
                 relation_loss = None
         if record_loss is not None:
             record_loss = {
@@ -1833,9 +2014,39 @@ class BoundaryExtractorModel(BaseExtractorModel):
         }
         return output.candidates, aux
 
+    def score_explicit_spans(
+        self,
+        encoded: EncodedBatch,
+        indices: torch.LongTensor,
+        valid_mask: Optional[torch.BoolTensor] = None,
+    ) -> torch.Tensor:
+        """Score explicit spans in an already encoded batch.
+
+        This architecture-aware public primitive bypasses proposal top-k while
+        preserving the checkpoint's proposal compatibility and pair reranker.
+        """
+        return self.boundary_head.score_explicit_spans(
+            encoded.text_states,
+            encoded.text_mask,
+            encoded.query_states,
+            encoded.query_mask,
+            indices,
+            valid_mask,
+        )
+
     # =========================================================================
     # Serialization
     # =========================================================================
+
+    def push_to_hub(self, repo_id: str, private: bool = True):
+        """Save and upload this boundary checkpoint to the Hugging Face Hub."""
+        from huggingface_hub import HfApi
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.save_pretrained(tmp_dir)
+            api = HfApi()
+            api.create_repo(repo_id=repo_id, private=private, exist_ok=True)
+            return api.upload_folder(repo_id=repo_id, folder_path=tmp_dir)
 
     def save_pretrained(self, save_directory: str, **kwargs):
         from safetensors.torch import save_file
@@ -1854,33 +2065,39 @@ class BoundaryExtractorModel(BaseExtractorModel):
 
     @classmethod
     def from_pretrained(cls, repo_or_dir: str, **kwargs):
-        from safetensors.torch import load_file
-        from huggingface_hub import hf_hub_download
-
         config = kwargs.pop("config", None)
-        map_location = kwargs.pop("map_location", None)
-        compile_model = kwargs.pop("compile", False)
-
-        def download_or_local(repo, filename):
-            if os.path.isdir(repo):
-                return os.path.join(repo, filename)
-            return hf_hub_download(repo, filename)
+        model_options, hub_kwargs = split_load_kwargs(
+            kwargs, context=f"{cls.__name__}.from_pretrained"
+        )
+        quantize = model_options.pop("quantize", False)
+        compile_model = model_options.pop("compile", False)
+        map_location = model_options.pop("map_location", None)
+        use_flashdeberta = model_options.pop("use_flashdeberta", None)
 
         if config is None:
-            config = cls.config_class.from_pretrained(download_or_local(repo_or_dir, "config.json"))
-        encoder_config = AutoConfig.from_pretrained(
-            download_or_local(repo_or_dir, "encoder_config/config.json")
-        )
-        tokenizer = AutoTokenizer.from_pretrained(repo_or_dir)
-        model = cls(config, encoder_config=encoder_config, tokenizer=tokenizer)
-
-        try:
-            state_dict = load_file(download_or_local(repo_or_dir, "model.safetensors"))
-        except Exception:
-            state_dict = torch.load(
-                download_or_local(repo_or_dir, "pytorch_model.bin"),
-                map_location="cpu", weights_only=True,
+            config = cls.config_class.from_pretrained(
+                checkpoint_file(repo_or_dir, "config.json", hub_kwargs)
             )
+        encoder_config = AutoConfig.from_pretrained(
+            checkpoint_file(
+                repo_or_dir, "encoder_config/config.json", hub_kwargs
+            )
+        )
+        tokenizer_source = repo_or_dir
+        if os.path.isdir(str(repo_or_dir)) and hub_kwargs.get("subfolder"):
+            tokenizer_source = os.path.join(
+                str(repo_or_dir), str(hub_kwargs["subfolder"])
+            )
+        tokenizer = load_extractor_tokenizer(tokenizer_source)
+        model = cls(
+            config,
+            encoder_config=encoder_config,
+            tokenizer=tokenizer,
+            use_flashdeberta=use_flashdeberta,
+        )
+
+        state_dict = load_checkpoint_state_dict(repo_or_dir, hub_kwargs)
+        reconcile_encoder_embeddings(model, state_dict)
         try:
             model.load_state_dict(state_dict)
         except RuntimeError as exc:
@@ -1900,11 +2117,13 @@ class BoundaryExtractorModel(BaseExtractorModel):
 
         model.config._name_or_path = repo_or_dir
         model.name_or_path = repo_or_dir
-        if map_location is not None:
-            model = model.to(map_location)
-        if compile_model:
-            model.compile(dynamic=True)
-        return model
+        return apply_post_load_options(
+            model,
+            map_location=map_location,
+            quantize=quantize,
+            compile_model=compile_model,
+            compile_dynamic=True,
+        )
 
 
 __all__ = [

@@ -699,6 +699,7 @@ class DecodedRecord:
     """One decoded record: field query id -> selected half-open token spans."""
 
     fields: Dict[int, List[Tuple[int, int]]] = field(default_factory=dict)
+    field_scores: Dict[int, List[float]] = field(default_factory=dict)
     anchor_span: Optional[Tuple[int, int]] = None
     score: float = 0.0
 
@@ -727,12 +728,76 @@ def decode_group(
     obj_prob = torch.sigmoid(group.object_logits.detach() / temperature)
     select_thr = object_threshold if group.spec.mode == "anchorless" else anchor_threshold
     order = sorted(range(ni), key=lambda i: (-float(obj_prob[i]), i))
+    selected_instances = [
+        inst for inst in order if float(obj_prob[inst]) >= select_thr
+    ]
 
-    used_exclusive: set = set()
-    records: List[DecodedRecord] = []
-    for inst in order:
-        if float(obj_prob[inst]) < select_thr:
+    # Exclusive fields are a global assignment problem: greedily letting the
+    # highest-object instance claim its favorite candidate can force later
+    # instances onto unrelated spans. Solve scalar fields jointly and allocate
+    # each list candidate to its strongest instance.
+    scalar_choices: Dict[Tuple[int, int], Optional[Tuple[int, float]]] = {}
+    list_owners: Dict[Tuple[int, int], Tuple[int, float]] = {}
+    for f_idx, fspec in enumerate(group.field_specs):
+        if not fspec.exclusive or not selected_instances:
             continue
+        logits = torch.stack([
+            group.assign_logits[f_idx][inst].detach() / temperature
+            for inst in selected_instances
+        ])
+        candidate_count = max(int(logits.shape[-1]) - 1, 0)
+        if fspec.cardinality.is_scalar:
+            if candidate_count == 0:
+                for inst in selected_instances:
+                    scalar_choices[(inst, f_idx)] = None
+                continue
+            probs = torch.softmax(logits, dim=-1)
+            candidate_probs = probs[:, 1:]
+            eps = torch.finfo(candidate_probs.dtype).eps
+            candidate_cost = -torch.log(candidate_probs.clamp_min(eps))
+            row_count = len(selected_instances)
+            diagonal = -torch.log(probs[:, 0].clamp_min(eps))
+            if not fspec.allows_absent:
+                # Keep a finite emergency ABSENT column for under-capacity
+                # schemas, but never prefer it while a candidate is available.
+                diagonal = candidate_cost.max().detach() + 50.0
+                diagonal = diagonal.expand(row_count)
+            invalid_cost = max(
+                float(candidate_cost.max()),
+                float(diagonal.max()),
+            ) + 1_000.0
+            absent_cost = candidate_cost.new_full(
+                (row_count, row_count),
+                invalid_cost,
+            )
+            absent_cost[torch.arange(row_count), torch.arange(row_count)] = diagonal
+            cost = torch.cat((candidate_cost, absent_cost), dim=-1)
+            rows, cols = linear_sum_assignment(cost)
+            assignments = {int(row): int(col) for row, col in zip(rows, cols)}
+            for row, inst in enumerate(selected_instances):
+                col = assignments.get(row, candidate_count + row)
+                if col >= candidate_count:
+                    scalar_choices[(inst, f_idx)] = None
+                    continue
+                probability = float(candidate_probs[row, col])
+                if probability < field_threshold and fspec.allows_absent:
+                    scalar_choices[(inst, f_idx)] = None
+                    continue
+                scalar_choices[(inst, f_idx)] = (col, probability)
+        else:
+            if candidate_count == 0:
+                continue
+            probabilities = torch.sigmoid(logits[:, 1:])
+            for cand_idx in range(candidate_count):
+                probability, row = probabilities[:, cand_idx].max(dim=0)
+                if float(probability) >= field_threshold:
+                    list_owners[(f_idx, cand_idx)] = (
+                        selected_instances[int(row)],
+                        float(probability),
+                    )
+
+    records: List[DecodedRecord] = []
+    for inst in selected_instances:
         rec = DecodedRecord(score=float(obj_prob[inst]))
         anchor_field_idx = None
         if group.spec.mode == "natural":
@@ -748,17 +813,29 @@ def decode_group(
             if anchor_field_idx is not None and f_idx == anchor_field_idx:
                 if rec.anchor_span is not None:
                     rec.fields.setdefault(qid, []).append(rec.anchor_span)
+                    rec.field_scores.setdefault(qid, []).append(rec.score)
                 continue
 
             if fspec.cardinality.is_scalar:
+                if fspec.exclusive:
+                    choice = scalar_choices.get((inst, f_idx))
+                    if choice is None:
+                        continue
+                    cand_idx, probability = choice
+                    span = (
+                        int(spans_tensor[cand_idx, 0]),
+                        int(spans_tensor[cand_idx, 1]),
+                    )
+                    rec.fields.setdefault(qid, []).append(span)
+                    rec.field_scores.setdefault(qid, []).append(probability)
+                    continue
                 probs = torch.softmax(logits_row, dim=-1)
                 chosen = None
                 for col in torch.argsort(probs, descending=True).tolist():
                     if col == 0:
-                        chosen = 0
-                        break
-                    cand_idx = col - 1
-                    if fspec.exclusive and (f_idx, cand_idx) in used_exclusive:
+                        if fspec.allows_absent:
+                            chosen = 0
+                            break
                         continue
                     chosen = col
                     break
@@ -769,25 +846,30 @@ def decode_group(
                 cand_idx = chosen - 1
                 span = (int(spans_tensor[cand_idx, 0]), int(spans_tensor[cand_idx, 1]))
                 rec.fields.setdefault(qid, []).append(span)
-                if fspec.exclusive:
-                    used_exclusive.add((f_idx, cand_idx))
+                rec.field_scores.setdefault(qid, []).append(float(probs[chosen]))
             else:
                 cand_logits = logits_row[1:]
                 if cand_logits.numel() == 0:
                     continue
                 probs = torch.sigmoid(cand_logits)
                 selected: List[Tuple[int, int]] = []
+                selected_scores: List[float] = []
                 for cand_idx in range(cand_logits.shape[0]):
-                    if float(probs[cand_idx]) < field_threshold:
-                        continue
-                    if fspec.exclusive and (f_idx, cand_idx) in used_exclusive:
-                        continue
+                    if fspec.exclusive:
+                        owner = list_owners.get((f_idx, cand_idx))
+                        if owner is None or owner[0] != inst:
+                            continue
+                        probability = owner[1]
+                    else:
+                        probability = float(probs[cand_idx])
+                        if probability < field_threshold:
+                            continue
                     span = (int(spans_tensor[cand_idx, 0]), int(spans_tensor[cand_idx, 1]))
                     selected.append(span)
-                    if fspec.exclusive:
-                        used_exclusive.add((f_idx, cand_idx))
+                    selected_scores.append(probability)
                 if selected:
                     rec.fields.setdefault(qid, []).extend(selected)
+                    rec.field_scores.setdefault(qid, []).extend(selected_scores)
         if rec.fields:
             records.append(rec)
 
@@ -798,6 +880,13 @@ def decode_group(
             if key not in best or rec.score > best[key].score:
                 best[key] = rec
         records = list(best.values())
+    elif group.spec.mode == "natural":
+        records.sort(
+            key=lambda record: (
+                record.anchor_span is None,
+                record.anchor_span or (0, 0),
+            )
+        )
     return records
 
 

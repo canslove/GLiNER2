@@ -678,6 +678,16 @@ class ExtractorConfig(PretrainedConfig):
     model_type = "extractor"
     current_config_version = 3
 
+    @classmethod
+    def from_dict(cls, config_dict: Mapping[str, Any], **kwargs: Any):
+        """Construct from a migrated raw dictionary.
+
+        ``PretrainedConfig.from_pretrained`` delegates here, making migration
+        part of both local and Hub loading without changing direct construction
+        defaults for newly-created configs.
+        """
+        return super().from_dict(migrate_config_dict(config_dict), **kwargs)
+
     def __init__(
         self,
         model_name: str = "bert-base-uncased",

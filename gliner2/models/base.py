@@ -18,11 +18,42 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import AutoConfig, AutoModel, PretrainedConfig, PreTrainedModel
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoTokenizer,
+    PretrainedConfig,
+    PreTrainedModel,
+)
 
 from gliner2.configuration import ExtractorConfig
 
 logger = logging.getLogger(__name__)
+
+
+def load_extractor_tokenizer(repo_or_dir: str):
+    """Load checkpoint tokenizers across Transformers metadata versions.
+
+    Older GLiNER2 checkpoints serialized ``extra_special_tokens`` as a list.
+    Newer Transformers releases reserve that field for a name-to-token mapping
+    and fail before ``SchemaTransformer`` can register GLiNER2's special tokens.
+    Retry only that known incompatibility while leaving all other load failures
+    untouched.
+    """
+    try:
+        return AutoTokenizer.from_pretrained(repo_or_dir)
+    except AttributeError as exc:
+        if "'list' object has no attribute 'keys'" not in str(exc):
+            raise
+        warnings.warn(
+            "Checkpoint uses legacy list-valued extra_special_tokens metadata; "
+            "loading with compatibility normalization.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return AutoTokenizer.from_pretrained(
+            repo_or_dir, extra_special_tokens={}
+        )
 
 
 # =============================================================================
@@ -121,6 +152,7 @@ class BaseExtractorModel(PreTrainedModel):
         model_name: str,
         encoder_config: Optional[PretrainedConfig] = None,
         attn_implementation: Optional[str] = "sdpa",
+        use_flashdeberta: Optional[bool] = None,
     ) -> nn.Module:
         """Load a shared optimized encoder with a safe eager fallback."""
         config = encoder_config
@@ -129,24 +161,46 @@ class BaseExtractorModel(PreTrainedModel):
                 model_name, trust_remote_code=True
             )
 
-        use_flashdeberta = bool(os.environ.get("USE_FLASHDEBERTA")) and (
+        if use_flashdeberta is None:
+            use_flashdeberta = bool(os.environ.get("USE_FLASHDEBERTA"))
+        flashdeberta_available = (
             importlib.util.find_spec("flashdeberta") is not None
         )
-        if config.__class__.__name__ == "DebertaV2Config" and use_flashdeberta:
-            from flashdeberta import FlashDebertaV2Model
+        if (
+            config.__class__.__name__ == "DebertaV2Config"
+            and use_flashdeberta
+            and flashdeberta_available
+        ):
+            try:
+                from flashdeberta import FlashDebertaV2Model
 
-            logger.info("Using FlashDeberta backend")
-            if encoder_config is not None:
-                return FlashDebertaV2Model(config)
-            return FlashDebertaV2Model.from_pretrained(model_name)
+                logger.info("Using FlashDeBERTa backend")
+                if encoder_config is not None:
+                    return FlashDebertaV2Model(config).float()
+                return FlashDebertaV2Model.from_pretrained(model_name).float()
+            except Exception as error:  # noqa: BLE001 - optional backend boundary
+                warnings.warn(
+                    "FlashDeBERTa could not initialize; falling back to the "
+                    f"standard Transformers encoder ({error})",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         def load(implementation: Optional[str]) -> nn.Module:
             kwargs = {"trust_remote_code": True}
             if implementation:
                 kwargs["attn_implementation"] = implementation
             if encoder_config is not None:
-                return AutoModel.from_config(config, **kwargs)
-            return AutoModel.from_pretrained(model_name, **kwargs)
+                encoder = AutoModel.from_config(config, **kwargs)
+            else:
+                encoder = AutoModel.from_pretrained(model_name, **kwargs)
+            # Transformers 5 honors a serialized encoder dtype during
+            # ``from_config``. GLiNER2 task heads are initialized in FP32, so a
+            # half-precision encoder would emit activations that cannot enter
+            # those heads. Build the complete model consistently in FP32;
+            # callers can still cast it atomically with ``model.half()`` or
+            # ``model.to(dtype=...)`` afterwards.
+            return encoder.float()
 
         try:
             return load(attn_implementation)

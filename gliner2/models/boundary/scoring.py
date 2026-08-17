@@ -254,7 +254,9 @@ class SparseBoundaryPairScorer(nn.Module):
             interval = interval_prefix_score(
                 inside_prefix, starts, ends, inside_prefix_mean
             ).to(score.dtype)
-            denom = torch.sqrt((ends - starts).clamp(min=1).float())
+            denom = torch.sqrt(
+                (ends - starts).clamp(min=1).to(score.dtype)
+            )
             inside_weight = (
                 self.inside_weight(query_states).squeeze(-1).unsqueeze(-1)
                 if self.query_conditioned_inside_weight
@@ -265,7 +267,7 @@ class SparseBoundaryPairScorer(nn.Module):
         # Length features.
         feats = continuous_length_features(starts, ends, text_lengths)     # [B,Q,C,3]
         length_coeff = self.length_query_projection(query_states).unsqueeze(2)  # [B,Q,1,3]
-        length_score = (feats * length_coeff).sum(-1)                      # [B,Q,C]
+        length_score = (feats.to(length_coeff.dtype) * length_coeff).sum(-1)  # [B,Q,C]
         score = score + length_score
 
         return mask_invalid_candidate_logits(score, valid)

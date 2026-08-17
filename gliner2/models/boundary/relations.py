@@ -364,7 +364,12 @@ class SparseRelationScorer(nn.Module):
         t_end = gather(relation_pairs.tail_end - 1)
         rel = relation_query_states[b, relation_index]
 
-        delta = (relation_pairs.tail_start - relation_pairs.head_start).float()
+        # Positional features originate from integer indices; create them in
+        # the activation dtype before concatenating with encoder states so the
+        # relation MLP remains compatible with FP16/BF16 models.
+        delta = (relation_pairs.tail_start - relation_pairs.head_start).to(
+            boundary_states.dtype
+        )
         order = torch.sign(delta).unsqueeze(-1)
         dist = (delta.abs() / float(max(length, 1))).unsqueeze(-1)
 

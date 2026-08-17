@@ -9,7 +9,9 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 import torch
 
 from gliner2.inference.schema import Schema
+from gliner2.models.loading import LOAD_OPTIONS
 from .scoring import RawScorer, ScoreLattice, resolve_device, resolve_dtype
+from .candidate_scores import CandidateScoreSet, candidate_score_set_to_problem
 
 
 @dataclass(frozen=True)
@@ -46,7 +48,7 @@ class JointIEConfig:
             raise ValueError("rescue_per_role must be positive")
 
 
-_MODEL_LOAD_OPTIONS = frozenset({"quantize", "compile", "map_location"})
+_MODEL_LOAD_OPTIONS = LOAD_OPTIONS
 _PREDICTION_OPTIONS = frozenset(item.name for item in fields(JointIEConfig))
 
 
@@ -152,7 +154,7 @@ class JointIEEngine:
     def from_pretrained(cls, repo_or_dir: str, *, device: Any = None,
                         dtype: Any = None, **kwargs: Any) -> "JointIEEngine":
         """Load a model; prediction controls belong in ``JointIEConfig`` per call."""
-        from gliner2 import GLiNER2
+        from gliner2 import AutoExtractor
         rejected = sorted(set(kwargs) & _PREDICTION_OPTIONS)
         if rejected:
             raise TypeError(
@@ -162,7 +164,7 @@ class JointIEEngine:
         unknown = sorted(set(kwargs) - _MODEL_LOAD_OPTIONS)
         if unknown:
             raise TypeError(f"unknown from_pretrained options: {unknown}")
-        model = GLiNER2.from_pretrained(repo_or_dir, **kwargs)
+        model = AutoExtractor.from_pretrained(repo_or_dir, **kwargs)
         return cls(model, device=device, dtype=dtype)
 
     @property
@@ -208,14 +210,16 @@ class JointIEEngine:
             self._compiled_schemas[key] = _invoke(compile_fn, schema=schema) if compile_fn else schema
         return self._compiled_schemas[key]
 
-    def score(self, text: str, schema: Any, *, config: Optional[JointIEConfig] = None) -> ScoreLattice:
+    def score(self, text: str, schema: Any, *, config: Optional[JointIEConfig] = None) -> Any:
         config = _coerce_config(config)
         compiled = schema if self._is_compiled(schema) else self.compile_schema(schema)
         return self.scorer.score(text, compiled, count_top_k=config.count_top_k,
-                                 max_len=config.max_len)
+                                 max_len=config.max_len,
+                                 top_k_roles=config.top_k_roles,
+                                 relation_pair_cap=config.relation_pair_cap)
 
     def batch_score(self, texts: Sequence[str], schemas: Any, *,
-                    config: Optional[JointIEConfig] = None) -> List[ScoreLattice]:
+                    config: Optional[JointIEConfig] = None) -> List[Any]:
         config = _coerce_config(config)
         texts = list(texts)
         if isinstance(schemas, (list, tuple)):
@@ -227,7 +231,9 @@ class JointIEEngine:
             compiled = schemas if self._is_compiled(schemas) else self.compile_schema(schemas)
         return self.scorer.batch_score(texts, compiled, batch_size=config.batch_size,
                                        max_len=config.max_len,
-                                       count_top_k=config.count_top_k)
+                                       count_top_k=config.count_top_k,
+                                       top_k_roles=config.top_k_roles,
+                                       relation_pair_cap=config.relation_pair_cap)
 
     def _make_candidates(self, config: JointIEConfig) -> Any:
         component = self._candidate_component
@@ -308,7 +314,34 @@ class JointIEEngine:
         candidates = self._make_candidates(config)
         optimizer = self._make_optimizer(config)
         result_builder = self._make_result_builder(config)
-        problem = self._problem_from_lattice(lattice, compiled_schema, candidates)
+        if isinstance(lattice, CandidateScoreSet):
+            entity_specs = getattr(compiled_schema, "entity_specs", {})
+            problem = candidate_score_set_to_problem(
+                lattice,
+                mention_threshold=(
+                    config.entity_threshold
+                    if config.entity_threshold is not None
+                    else config.candidate_threshold
+                ),
+                constraints=getattr(compiled_schema, "constraints", ()),
+                max_mentions_per_type=config.top_k_entities,
+                max_mentions_by_type={
+                    name: spec.max_candidates
+                    for name, spec in entity_specs.items()
+                    if spec.max_candidates is not None
+                },
+                rescue_relation_endpoints=True,
+                edge_candidate_threshold=config.relation_role_threshold,
+                max_edges_per_type=min(
+                    config.relation_pair_cap, config.max_edges_per_type
+                ),
+                entity_weight=config.entity_weight,
+                relation_weight=config.role_weight,
+            )
+        else:
+            problem = self._problem_from_lattice(
+                lattice, compiled_schema, candidates
+            )
         solve = _method(optimizer, ("optimize", "solve", "decode"))
         build = _method(result_builder, ("build", "decode", "build_result"))
         if solve is None or build is None:

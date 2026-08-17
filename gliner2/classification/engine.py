@@ -18,6 +18,7 @@ from typing import Any, Optional
 import torch
 
 from ..joint_ie.calibration import Calibrator
+from ..models.loading import LOAD_OPTIONS
 from .compiler import CompiledClassificationSchema, compile_schema, _fingerprint
 from .decoding import build_problem, decode as _decode
 from .errors import SchemaError
@@ -27,7 +28,7 @@ from .scoring import ClassificationScorer
 
 _DECODERS = ("auto", "independent", "exact", "beam")
 _ON_INFEASIBLE = ("relax", "min_violations", "raise")
-_MODEL_LOAD_OPTIONS = frozenset({"quantize", "compile", "map_location"})
+_MODEL_LOAD_OPTIONS = LOAD_OPTIONS
 _CACHE_CAP = 128
 
 
@@ -80,7 +81,7 @@ class Classifier:
     @classmethod
     def from_pretrained(cls, repo_or_dir: str, *, device=None, dtype=None,
                         **kwargs) -> "Classifier":
-        from gliner2 import GLiNER2
+        from gliner2 import AutoExtractor
         unknown = sorted(set(kwargs) - _MODEL_LOAD_OPTIONS)
         if unknown:
             raise TypeError(
@@ -88,7 +89,7 @@ class Classifier:
                 f"belong in ClassificationConfig(...) passed as config= per call. "
                 f"from_pretrained accepts only {sorted(_MODEL_LOAD_OPTIONS)}."
             )
-        model = GLiNER2.from_pretrained(repo_or_dir, **kwargs)
+        model = AutoExtractor.from_pretrained(repo_or_dir, **kwargs)
         return cls(model, device=device, dtype=dtype)
 
     # ---- lifecycle -----------------------------------------------------

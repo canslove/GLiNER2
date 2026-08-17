@@ -515,8 +515,12 @@ class SharedPoolScorer(nn.Module):
         starts, ends = pooled.indices[..., 0], pooled.indices[..., 1]
         start_rep = gather_rows(self.start_projection(boundary_states), starts)
         end_rep = gather_rows(self.end_projection(boundary_states), ends)
-        length = (ends - starts).clamp_min(1).float()
-        tl = text_lengths[:, None].float().clamp_min(1)
+        # Integer-derived length features default to FP32. Match the learned
+        # projections so ``model.half()``/BF16 inference cannot feed FP32
+        # activations into reduced-precision Linear layers.
+        feature_dtype = start_rep.dtype
+        length = (ends - starts).clamp_min(1).to(feature_dtype)
+        tl = text_lengths[:, None].to(feature_dtype).clamp_min(1)
         length_features = torch.stack(
             (torch.log1p(length), length / tl, torch.rsqrt(length)), -1
         )
@@ -529,7 +533,7 @@ class SharedPoolScorer(nn.Module):
             prior = start_rep.new_zeros(starts.shape)
         candidate = (
             start_rep + end_rep + self.length_projection(length_features)
-            + self.prior_projection(prior.unsqueeze(-1))
+            + self.prior_projection(prior.unsqueeze(-1).to(feature_dtype))
         )
         if self.content_pooler is not None:
             mean_prefix, lse_prefix = self.content_pooler.build_prefix(

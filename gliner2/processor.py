@@ -83,17 +83,17 @@ class PreprocessedBatch:
     def to(self, device: torch.device, dtype: torch.dtype = None) -> 'PreprocessedBatch':
         """Move tensors to device and optionally cast float tensors to dtype.
 
-        Integer tensors (input_ids, text_word_indices) are moved to the device
-        but keep their original dtype regardless of the *dtype* argument.
+        Integer and boolean tensors are moved to the device but keep their
+        original dtype regardless of the *dtype* argument.
         """
-        def _cast(t, is_int=False):
+        def _cast(t):
             t = t.to(device)
-            if dtype is not None and not is_int:
+            if dtype is not None and (t.is_floating_point() or t.is_complex()):
                 t = t.to(dtype)
             return t
 
         return PreprocessedBatch(
-            input_ids=_cast(self.input_ids, is_int=True),
+            input_ids=_cast(self.input_ids),
             attention_mask=_cast(self.attention_mask),
             mapped_indices=self.mapped_indices,
             schema_counts=self.schema_counts,
@@ -107,37 +107,37 @@ class PreprocessedBatch:
             original_texts=self.original_texts,
             original_schemas=self.original_schemas,
             text_word_indices=(
-                _cast(self.text_word_indices, is_int=True)
+                _cast(self.text_word_indices)
                 if self.text_word_indices is not None else None
             ),
             text_word_mask=(
-                _cast(self.text_word_mask, is_int=True)
+                _cast(self.text_word_mask)
                 if self.text_word_mask is not None else None
             ),
             text_word_counts=self.text_word_counts,
             schema_special_indices=self.schema_special_indices,
             query_marker_indices=(
-                _cast(self.query_marker_indices, is_int=True)
+                _cast(self.query_marker_indices)
                 if self.query_marker_indices is not None else None
             ),
             query_marker_mask=(
-                _cast(self.query_marker_mask, is_int=True)
+                _cast(self.query_marker_mask)
                 if self.query_marker_mask is not None else None
             ),
             query_group_index=(
-                _cast(self.query_group_index, is_int=True)
+                _cast(self.query_group_index)
                 if self.query_group_index is not None else None
             ),
             cls_marker_indices=(
-                _cast(self.cls_marker_indices, is_int=True)
+                _cast(self.cls_marker_indices)
                 if self.cls_marker_indices is not None else None
             ),
             cls_marker_mask=(
-                _cast(self.cls_marker_mask, is_int=True)
+                _cast(self.cls_marker_mask)
                 if self.cls_marker_mask is not None else None
             ),
             cls_group_index=(
-                _cast(self.cls_group_index, is_int=True)
+                _cast(self.cls_group_index)
                 if self.cls_group_index is not None else None
             ),
             query_layouts=self.query_layouts,
@@ -871,10 +871,16 @@ class SchemaTransformer:
             # still safe because records are matched by name, not position.
             is_record = bool(record_meta.get(parent, {}).get("mode"))
 
-            all_fields = set()
+            # Preserve declaration order. Converting through a set made schema
+            # prompts depend on PYTHONHASHSEED, which could change both query
+            # ordering and decoded values across otherwise identical processes.
+            common = []
+            seen_fields = set()
             for occ in occurrences:
-                all_fields.update(occ.keys())
-            common = list(all_fields)
+                for field_name in occ:
+                    if field_name not in seen_fields:
+                        common.append(field_name)
+                        seen_fields.add(field_name)
 
             if sampling and sampling.shuffle_json_fields:
                 random.shuffle(common)
@@ -985,6 +991,7 @@ class SchemaTransformer:
         if "relations" not in schema:
             return
 
+        relation_descriptions = schema.get("relation_descriptions", {})
         groups = {}
         for item in schema["relations"]:
             if sampling and random.random() < sampling.remove_relations_prob:
@@ -1019,7 +1026,12 @@ class SchemaTransformer:
                     uniq.append(span)
 
             labels.append([len(uniq), uniq])
-            schemas.append(self._transform_schema(parent, field_names, self.R_TOKEN))
+            schemas.append(self._transform_schema(
+                parent,
+                field_names,
+                self.R_TOKEN,
+                prompt=relation_descriptions.get(parent),
+            ))
             types.append("relations")
 
     def _process_classifications(self, schema, schemas, labels, types, sampling):
