@@ -1,7 +1,7 @@
 # GLiNER2: Unified Schema-Based Information Extraction and Text Classification
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyPI version](https://badge.fury.io/py/gliner2.svg)](https://badge.fury.io/py/gliner2)
 [![Downloads](https://pepy.tech/badge/gliner2)](https://pepy.tech/project/gliner2)
 [![Reddit](https://img.shields.io/badge/Reddit-r%2FGLiNER-FF4500?logo=reddit&logoColor=white)](https://www.reddit.com/r/GLiNER/)
@@ -21,18 +21,52 @@ Fine-tune via [Pioneer](https://pioneer.ai/gliner). Additional documentation via
 
 ## 🚀 Installation & Quick Start
 
+GLiNER2 requires Python 3.10 or newer. Choose the smallest install profile that
+matches your use case:
+
 ```bash
 # Schema validation, API client, training-data utilities — no torch required
 pip install gliner2
 
-# Full local inference and training (installs torch, transformers, etc.)
+# Local model inference and LoRA support
 pip install gliner2[local]
+
+# Model training and recipe configuration
+pip install gliner2[train]
+
+# Reproducible tests, contributor tooling, or benchmarks
+pip install gliner2[test]
+pip install gliner2[dev]
+pip install gliner2[benchmark]
 ```
 
 The base install gives you `Schema`, `SchemaInput`, `RegexValidator`, `GLiNER2API`,
 `InputExample`, `TrainingDataset`, and all JSONL validation tooling — everything
 needed to build schemas, validate data, and call the cloud API without pulling in
-PyTorch.
+PyTorch. `API` is a concise alias for `GLiNER2API`:
+
+```python
+from gliner2 import API, InputExample, Schema, TrainingDataset
+```
+
+The torch-free API client partitions batch requests locally and can scan long
+documents without changing the server protocol:
+
+```python
+client = API()  # reads PIONEER_API_KEY
+results = client.batch_extract_entities(
+    documents,
+    ["company", "person"],
+    batch_size=8,
+)
+long_result = client.extract_entities_long(
+    annual_report,
+    ["company", "person"],
+    chunk_size=384,
+    chunk_overlap=64,
+    include_spans=True,
+)
+```
 
 To load and run models locally, install the `[local]` extra:
 
@@ -71,9 +105,9 @@ model.compile()
 
 ### 🧭 Multi-architecture: `AutoExtractor` & the boundary architecture
 
-GLiNER2 supports two extraction architectures behind one API: the stable `span`
-architecture (`GLiNER2` / `SpanExtractor`) and an experimental `boundary`
-architecture (`BoundaryExtractor`) whose **sparse** start/end pairing supports
+GLiNER2 supports two first-class extraction architectures behind one API: the
+`span` architecture (`GLiNER2` / `SpanExtractor`) and the `boundary`
+architecture (`BoundaryExtractor`), whose **sparse** start/end pairing supports
 spans of any length within the encoded window. `AutoExtractor.from_pretrained`
 picks the right class from the checkpoint's `architecture` field (missing/legacy
 configs default to `span`, so existing checkpoints load unchanged):
@@ -81,17 +115,19 @@ configs default to `span`, so existing checkpoints load unchanged):
 ```python
 from gliner2 import AutoExtractor
 
-model = AutoExtractor.from_pretrained("path/or/hub-id")  # span or boundary
+# Dispatches to BoundaryExtractor from the saved architecture metadata.
+model = AutoExtractor.from_pretrained("fastino/gliner2.5-multi-v1")
 result = model.extract_entities("Apple released iPhone 15.", ["company", "product"])
 ```
 
 `GLiNER2` remains fully backward compatible (`GLiNER2 = SpanExtractor` subclass).
-The boundary architecture is **experimental** and supports entities,
-classification, optional structured record/event decoding, and optional sparse
-relation extraction. Records and relations must be enabled when creating the
-boundary checkpoint. See the full guide — loading, creating/training a boundary
-model, record and relation decoding, save/load, LoRA aliases, export mode, the
-new loss/imbalance controls (`boundary_negative_weight`, `boundary_marginal_loss`,
+The boundary architecture supports entities, classification, structured
+record/event decoding, and sparse relation extraction when those heads are
+enabled by the checkpoint. It has the same save/reload, quantization,
+compilation, Hub upload, and LoRA entry points as span models. See the full
+guide — loading, creating/training a boundary model, record and relation
+decoding, save/load, LoRA aliases, export mode, the loss/imbalance controls
+(`boundary_negative_weight`, `boundary_marginal_loss`,
 `classification_loss_weight`), and the gold-capacity policy
 (`TrainingConfig.on_capacity_exceeded`) — in
 [`docs/boundary_architecture.md`](docs/boundary_architecture.md).
@@ -102,6 +138,7 @@ new loss/imbalance controls (`boundary_negative_weight`, `boundary_marginal_loss
 |-------|------------|-------------|--------------------------------------------------|
 | `fastino/gliner2-base-v1` | 205M | base size   | Extraction / classification |
 | `fastino/gliner2-large-v1` | 340M | large size  | Extraction / classification                      |
+| `fastino/gliner2.5-multi-v1` | 205M | boundary multi-task | Entities, classification, records, relations |
 
 The models are available on [Hugging Face](https://huggingface.co/collections/fastino/gliner2-family).
 
@@ -118,6 +155,9 @@ Comprehensive guides for all GLiNER2 features:
 - **[Relation Extraction](tutorial/6-relation_extraction.md)** - Extract relationships between entities
 - **[API Access](tutorial/7-api.md)** - Use GLiNER2 via cloud API
 - **[Long-Context Extraction](tutorial/12-long_context.md)** - Scan long documents with overlapping chunks and global spans
+- **[Span Attributes](tutorial/13-span_attributes.md)** - Attach sentiment and other labels to entity spans
+- **[Constrained Classification](tutorial/14-constrained_classification.md)** - Multi-task labels with hard cross-task constraints
+- **[Joint Information Extraction](tutorial/15-joint_ie.md)** - Entities and relations decoded together under graph constraints
 
 ### Training & Customization
 - **[Training Data Format](tutorial/8-train_data.md)** - Complete guide to preparing training data
@@ -221,6 +261,12 @@ for company in result["entities"].get("company", []):
 For multiple documents, use `batch_extract_entities_long(...)` or the generic
 `batch_extract_long(...)` with a schema. Increase `chunk_overlap` when important
 entities or relations may appear near chunk boundaries.
+
+All extraction methods accept the same explicit `overlap_policy`: `allow`
+keeps every distinct span, `nested` permits containment but rejects crossing
+spans, `flat`/`disallow` selects a deterministic non-overlapping set, and
+`longest` removes strictly contained spans. Leaving it as `None` preserves the
+loaded architecture's checkpoint-compatible default.
 
 ### 2. Text Classification
 Single or multi-label classification with configurable confidence:
@@ -822,9 +868,9 @@ results = extractor.extract(text, schema)
 # Output: {'user': [{'username': 'john_doe'}]}  # Only valid usernames
 ```
 
-## FlashDeberta (Optional GPU Acceleration)
+## FlashDeBERTa (Optional GPU Acceleration)
 
-For DebertaV2-based models, you can use [FlashDeberta](https://github.com/fastino-ai/flashdeberta) to accelerate inference on GPU via flash attention kernels.
+For DeBERTaV2-based models, you can use [FlashDeBERTa](https://github.com/fastino-ai/flashdeberta) to accelerate inference on NVIDIA GPUs via flash attention kernels.
 
 **Install:**
 
@@ -835,13 +881,14 @@ pip install flashdeberta
 **Use:**
 
 ```python
-import os
-os.environ["USE_FLASHDEBERTA"] = "1"  # set before importing gliner2
+from gliner2 import AutoExtractor
 
-from gliner2 import GLiNER2
-
-extractor = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
-# Prints: "Using FlashDeberta backend."
+extractor = AutoExtractor.from_pretrained(
+    "fastino/gliner2-base-v1",
+    use_flashdeberta=True,
+    map_location="cuda",
+)
+extractor.half().eval()
 
 result = extractor.extract_entities(
     "Apple CEO Tim Cook announced iPhone 15 in Cupertino.",
@@ -849,12 +896,22 @@ result = extractor.extract_entities(
 )
 ```
 
-The flag is only effective when the model uses a DebertaV2 encoder and the `flashdeberta` package is installed. Otherwise standard HuggingFace `AutoModel` is used automatically.
+The option works for both span and boundary checkpoints. It is only effective when the model uses a DeBERTaV2 encoder and the `flashdeberta` package is installed; otherwise the standard Hugging Face encoder is used. For backward compatibility, setting `USE_FLASHDEBERTA=1` still enables it when `use_flashdeberta` is omitted. Passing `use_flashdeberta=False` explicitly overrides the environment variable.
 
-A benchmark script is included to compare the two backends:
+Use FP16 or BF16 on CUDA to realize the flash-kernel speedup. The benchmark compares both backends in separate processes, verifies that FlashDeBERTa actually activated, and reports latency, statistical significance, and peak memory:
 
 ```bash
-python benchmarks/benchmark_flashdeberta.py
+# End-to-end extraction (FP16 is the CUDA default)
+python benchmarks/benchmark_flashdeberta.py --dtype fp16 --architecture auto
+
+# Encoder-only comparison, excluding preprocessing and decoding
+python benchmarks/benchmark_flashdeberta.py --dtype fp16 --encoder-only
+
+# Boundary checkpoint (the model config must declare boundary architecture)
+python benchmarks/benchmark_flashdeberta.py \
+  --model /path/to/boundary-checkpoint \
+  --architecture boundary \
+  --dtype bf16
 ```
 
 ## 📦 Batch Processing
@@ -1094,6 +1151,15 @@ model = GLiNER2.from_pretrained("./ner_model/best")
 ```
 
 For more details, see the [Training Tutorial](tutorial/9-training.md) and [Data Format Guide](tutorial/8-train_data.md).
+
+## 🚢 Release process
+
+Every release must pass Python 3.10–3.12 CI, offline and checkpoint quality
+gates, CUDA hardware checks, and fresh wheel/sdist installation smoke tests.
+Version tags build artifacts automatically, but PyPI publishing stays disabled
+until the protected trusted-publishing environment and repository opt-in
+variable are configured. Maintainers should follow the complete
+[release checklist](RELEASE.md); local token uploads are not supported.
 
 ## 📄 License
 

@@ -11,6 +11,7 @@ from gliner2.auto import (
     ArchitectureRegistrationError,
 )
 from gliner2.configuration import ExtractorConfig
+from tests.fixtures.tiny_boundary_checkpoint import save_tiny_boundary_checkpoint
 from tests.fixtures.tiny_span_checkpoint import save_tiny_span_checkpoint
 
 
@@ -91,7 +92,61 @@ def test_from_pretrained_dispatches_span(tmp_path):
     assert model.architecture == "span"
 
 
+def test_from_pretrained_dispatches_boundary(tmp_path):
+    save_tiny_boundary_checkpoint(tmp_path)
+    model = AutoExtractor.from_pretrained(str(tmp_path))
+    from gliner2.inference.engine import BoundaryExtractor
+    assert isinstance(model, BoundaryExtractor)
+    assert model.architecture == "boundary"
+
+
 def test_from_pretrained_architecture_mismatch_raises(tmp_path):
     save_tiny_span_checkpoint(tmp_path)
-    with pytest.raises(ArchitectureMismatchError):
+    with pytest.raises(ArchitectureMismatchError) as exc_info:
         AutoExtractor.from_pretrained(str(tmp_path), architecture="boundary")
+    assert "from_span_checkpoint" not in str(exc_info.value)
+    assert "automatic architecture conversion is not supported" in str(exc_info.value)
+
+
+def test_from_pretrained_rejects_unknown_load_option():
+    with pytest.raises(TypeError, match="does not accept.*beam_size"):
+        AutoExtractor.from_pretrained("unused", beam_size=4)
+
+
+def test_hub_options_are_used_for_config_but_not_forwarded(monkeypatch):
+    import gliner2.auto as auto_module
+
+    captured = {}
+
+    class DummySpan:
+        @classmethod
+        def from_pretrained(cls, path, *args, **kwargs):
+            captured["model"] = (path, args, kwargs)
+            return object()
+
+    config = ExtractorConfig(model_name="unused")
+
+    def fake_load_config(path, hub_kwargs):
+        captured["config"] = (path, hub_kwargs)
+        return config
+
+    monkeypatch.setattr(auto_module, "_load_config", fake_load_config)
+    monkeypatch.setattr(AutoExtractor, "_registry", {"span": DummySpan})
+    monkeypatch.setattr(auto_module, "_ensure_registered", lambda: None)
+
+    AutoExtractor.from_pretrained(
+        "org/repo",
+        revision="release",
+        token="secret",
+        map_location="cpu",
+    )
+
+    assert captured["config"] == (
+        "org/repo",
+        {"revision": "release", "token": "secret"},
+    )
+    assert captured["model"] == (
+        "org/repo",
+        (),
+        {"config": config, "map_location": "cpu"},
+    )

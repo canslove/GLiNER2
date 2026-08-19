@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from gliner2.inference.runtime import ExtractorRuntimeMixin
+from tests.fixtures.tiny_boundary_checkpoint import build_tiny_boundary_model
 
 
 class _FakeBatch:
@@ -78,4 +79,37 @@ def test_resilient_extraction_logs_and_returns_empty(caplog):
     with caplog.at_level("ERROR"):
         results = _run(runtime, n=2)
     assert results == [{}, {}]
+    assert "extraction failed for sample" in caplog.text
+
+
+def test_boundary_decoder_matches_strict_and_resilient_contract(
+    monkeypatch, caplog
+):
+    model = build_tiny_boundary_model()
+    batch = _FakeBatch(2)
+    batch.original_schemas = [{}, {}]
+    hidden = model.hidden_size
+    core = {
+        "query_states": torch.zeros(2, 0, hidden),
+        "query_mask": torch.zeros(2, 0, dtype=torch.bool),
+        "ext_specs": [[], []],
+        "rel_specs": [[], []],
+        "cls_specs": [[], []],
+        "word_offsets": [0, 0],
+    }
+    monkeypatch.setattr(model, "_encode_core", lambda _: core)
+    monkeypatch.setattr(
+        model,
+        "_decode_records",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("boundary boom")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="boundary boom"):
+        _run(model)
+
+    model.strict_extraction = False
+    with caplog.at_level("ERROR"):
+        assert _run(model) == [{}, {}]
     assert "extraction failed for sample" in caplog.text
