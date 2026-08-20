@@ -7,16 +7,23 @@
 [![Reddit](https://img.shields.io/badge/Reddit-r%2FGLiNER-FF4500?logo=reddit&logoColor=white)](https://www.reddit.com/r/GLiNER/)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white)](https://discord.gg/fastino)
 
-> *Extract entities, classify text, parse structured data, and extract relations—all in one efficient model.*
+> *Schema-driven information extraction and classification — entities, labels, records, relations, and span attributes in one local model.*
 
-GLiNER2 unifies **Named Entity Recognition**, **Text Classification**, **Structured Data Extraction**, and **Relation Extraction** into a single 205M parameter model. It provides efficient CPU-based inference without requiring complex pipelines or external API dependencies.
+GLiNER2 is a **schema-conditioned** encoder family for **Named Entity Recognition**, **Text Classification**, **Structured Data Extraction**, **Relation Extraction**, and **span attributes**. Two extraction architectures share one public API:
 
-Fine-tune via [Pioneer](https://pioneer.ai/gliner). Additional documentation via [Pioneer docs](https://agent.pioneer.ai/docs/api-reference). Join discussions on [Discord](https://discord.gg/fastino) and [Reddit](https://www.reddit.com/r/GLiNER/).
+- **`span`** (`GLiNER2` / `SpanExtractor`) — fixed-width span grid; legacy checkpoints and specialty fine-tunes (GLiGuard, PII).
+- **`boundary`** (`BoundaryExtractor`, **GLiNER2.5**) — sparse start/end pairing; any span length within the encoded window.
+
+Load any Hub checkpoint with `AutoExtractor.from_pretrained(...)`. It dispatches by the saved `architecture` field. `GLiNER2.from_pretrained(...)` remains span-only and will **not** load GLiNER2.5 boundary checkpoints.
+
+Fine-tune via [Fastino](https://fastino.ai). Join discussions on [Discord](https://discord.gg/fastino) and [Reddit](https://www.reddit.com/r/GLiNER/).
 
 ## ✨ Why GLiNER2?
 
-- **🎯 One Model, Four Tasks**: Entities, classification, structured data, and relations in a single forward pass
-- **💻 CPU First**: Lightning-fast inference on standard hardware—no GPU required
+- **🎯 One schema, many tasks**: entities, classification, structured records, relations, and span attributes in a single forward pass
+- **📐 Two architectures**: span (GLiNER2) and boundary (GLiNER2.5) behind `AutoExtractor`
+- **🔗 Constrained decoding**: `Classifier` for cross-task label rules; `JointIE` for typed entity–relation graphs
+- **💻 CPU first**: fast local inference on standard hardware — no GPU required
 - **🛡️ Privacy**: 100% local processing, zero external dependencies
 
 ## 🚀 Installation & Quick Start
@@ -68,21 +75,23 @@ long_result = client.extract_entities_long(
 )
 ```
 
-To load and run models locally, install the `[local]` extra:
+To load and run models locally, install the `[local]` extra and use
+`AutoExtractor` — it loads span, boundary, GLiGuard, and PII checkpoints:
 
 ```python
-from gliner2 import GLiNER2  # requires gliner2[local]
+from gliner2 import AutoExtractor  # requires gliner2[local]
 
-# Load model once, use everywhere
-extractor = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+# Default English GLiNER2.5 boundary checkpoint
+model = AutoExtractor.from_pretrained("fastino/gliner2.5-base-v1")
 
-# Extract entities in one line
 text = "Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday."
-result = extractor.extract_entities(text, ["company", "person", "product", "location"])
+result = model.extract_entities(text, ["company", "person", "product", "location"])
 
 print(result)
 # {'entities': {'company': ['Apple'], 'person': ['Tim Cook'], 'product': ['iPhone 15'], 'location': ['Cupertino']}}
 ```
+
+For legacy span checkpoints or explicit span-only loading, `GLiNER2.from_pretrained("fastino/gliner2-base-v1")` still works (`GLiNER2 = SpanExtractor`).
 
 ### Quantization and Compilation
 
@@ -90,80 +99,98 @@ Enable fp16 and/or `torch.compile` for faster inference — no extra dependencie
 
 ```python
 # fp16
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1", map_location="cuda", quantize=True)
+model = AutoExtractor.from_pretrained("fastino/gliner2.5-base-v1", map_location="cuda", quantize=True)
 
 # torch.compile (fused GPU kernels, first call triggers tracing)
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1", map_location="cuda", compile=True)
+model = AutoExtractor.from_pretrained("fastino/gliner2.5-base-v1", map_location="cuda", compile=True)
 
 # Both
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1", map_location="cuda", quantize=True, compile=True)
+model = AutoExtractor.from_pretrained("fastino/gliner2.5-base-v1", map_location="cuda", quantize=True, compile=True)
 
 # Or after loading
 model.quantize()
 model.compile()
 ```
 
-### 🧭 Multi-architecture: `AutoExtractor` & the boundary architecture
+### Architecture guide
 
-GLiNER2 supports two first-class extraction architectures behind one API: the
-`span` architecture (`GLiNER2` / `SpanExtractor`) and the `boundary`
-architecture (`BoundaryExtractor`), whose **sparse** start/end pairing supports
-spans of any length within the encoded window. `AutoExtractor.from_pretrained`
-picks the right class from the checkpoint's `architecture` field (missing/legacy
-configs default to `span`, so existing checkpoints load unchanged):
+The boundary architecture (**GLiNER2.5**) uses sparse start/end pairing instead of a fixed span-width grid, so spans of any length that fit in the encoded window are representable. It supports entities, classification, structured record/event decoding, sparse relations, and span attributes when enabled by the checkpoint.
 
-```python
-from gliner2 import AutoExtractor
-
-# Dispatches to BoundaryExtractor from the saved architecture metadata.
-model = AutoExtractor.from_pretrained("fastino/gliner2.5-multi-v1")
-result = model.extract_entities("Apple released iPhone 15.", ["company", "product"])
-```
-
-`GLiNER2` remains fully backward compatible (`GLiNER2 = SpanExtractor` subclass).
-The boundary architecture supports entities, classification, structured
-record/event decoding, and sparse relation extraction when those heads are
-enabled by the checkpoint. It has the same save/reload, quantization,
-compilation, Hub upload, and LoRA entry points as span models. See the full
-guide — loading, creating/training a boundary model, record and relation
-decoding, save/load, LoRA aliases, export mode, the loss/imbalance controls
-(`boundary_negative_weight`, `boundary_marginal_loss`,
-`classification_loss_weight`), and the gold-capacity policy
-(`TrainingConfig.on_capacity_exceeded`) — in
-[`docs/boundary_architecture.md`](docs/boundary_architecture.md).
+See the full guide — loading, creating/training a boundary model, record and relation decoding, save/load, LoRA aliases, export mode, loss/imbalance controls, and gold-capacity policy — in [`docs/boundary_architecture.md`](docs/boundary_architecture.md) and the design notes in [`docs/gliner2_5_boundary_architecture.md`](docs/gliner2_5_boundary_architecture.md).
 
 ## 📦 Available Models
 
-| Model | Parameters | Description | Use Case                                         |
-|-------|------------|-------------|--------------------------------------------------|
-| `fastino/gliner2-base-v1` | 205M | base size   | Extraction / classification |
-| `fastino/gliner2-large-v1` | 340M | large size  | Extraction / classification                      |
-| `fastino/gliner2.5-multi-v1` | 205M | boundary multi-task | Entities, classification, records, relations |
+All models are on the [GLiNER2 family collection](https://huggingface.co/collections/fastino/gliner2-family). Load with `AutoExtractor.from_pretrained(...)` unless noted.
 
-The models are available on [Hugging Face](https://huggingface.co/collections/fastino/gliner2-family).
+### GLiNER2 (span architecture)
+
+| Model | Parameters | Encoder | Language | Use case |
+|-------|------------|---------|----------|----------|
+| [`fastino/gliner2-base-v1`](https://huggingface.co/fastino/gliner2-base-v1) | 205M | DeBERTa-v3-base | English | Default span checkpoint |
+| [`fastino/gliner2-large-v1`](https://huggingface.co/fastino/gliner2-large-v1) | 340M | DeBERTa-v3-large | English | Higher-accuracy span |
+| [`fastino/gliner2-multi-v1`](https://huggingface.co/fastino/gliner2-multi-v1) | ~205M | mDeBERTa-v3-base | Multilingual | Multilingual span |
+
+### GLiNER2.5 (boundary architecture)
+
+| Model | Parameters | Encoder | Language | Use case |
+|-------|------------|---------|----------|----------|
+| [`fastino/gliner2.5-small-v1`](https://huggingface.co/fastino/gliner2.5-small-v1) | 74M | DeBERTa-v3-xsmall | English | Fast CPU / edge |
+| [`fastino/gliner2.5-base-v1`](https://huggingface.co/fastino/gliner2.5-base-v1) | 194M | DeBERTa-v3-base | English | Default English multi-task |
+| [`fastino/gliner2.5-multi-v1`](https://huggingface.co/fastino/gliner2.5-multi-v1) | 287M | mDeBERTa-v3-base | Multilingual | Default multilingual multi-task |
+
+Boundary checkpoints include classification, records, and relations when those heads are enabled. Prefer **`gliner2.5-base-v1`** for English and **`gliner2.5-multi-v1`** for multilingual.
+
+### Safety and PII (span fine-tunes)
+
+| Model | Parameters | Use case |
+|-------|------------|----------|
+| [`fastino/gliguard-LLMGuardrails-300M`](https://huggingface.co/fastino/gliguard-LLMGuardrails-300M) | ~300M | LLM prompt/response guardrails (safety, toxicity, jailbreak, refusal) |
+| [`fastino/gliner2-privacy-filter-PII-multi`](https://huggingface.co/fastino/gliner2-privacy-filter-PII-multi) | 205M | Multilingual PII detection (42 entity types) |
+| [`fastino/GLiNER2-Guardrails-PII-Multi`](https://huggingface.co/fastino/GLiNER2-Guardrails-PII-Multi) | 205M | Combined guardrails + PII in one checkpoint |
+
+See [Safety, PII, and GLiGuard](tutorial/16-safety_pii.md) for usage. GLiGuard and PII models are span checkpoints; `AutoExtractor` and `GLiNER2` both load them.
+
+**Loader cheat-sheet**
+
+| Goal | Checkpoint |
+|------|------------|
+| English IE (recommended) | `fastino/gliner2.5-base-v1` |
+| Multilingual IE | `fastino/gliner2.5-multi-v1` |
+| Small / fast English | `fastino/gliner2.5-small-v1` |
+| Legacy span | `fastino/gliner2-{base,large,multi}-v1` |
+| LLM guardrails | `fastino/gliguard-LLMGuardrails-300M` |
+| PII redaction | `fastino/gliner2-privacy-filter-PII-multi` |
+| Guardrails + PII | `fastino/GLiNER2-Guardrails-PII-Multi` |
 
 ## 📚 Documentation & Tutorials
 
-Comprehensive guides for all GLiNER2 features:
+### Core extraction (tutorials 1–7)
+- **[Text Classification](tutorial/1-classification.md)** — Single and multi-label classification
+- **[Entity Extraction](tutorial/2-ner.md)** — NER with descriptions and spans
+- **[Structured Data Extraction](tutorial/3-json_extraction.md)** — JSON / record structures
+- **[Combined Schemas](tutorial/4-combined.md)** — Multi-task extraction in one pass
+- **[Regex Validators](tutorial/5-validator.md)** — Filter and validate spans
+- **[Relation Extraction](tutorial/6-relation_extraction.md)** — Independent relation tuples
+- **[API Access](tutorial/7-api.md)** — Cloud API via `GLiNER2API`
 
-### Core Features
-- **[Text Classification](tutorial/1-classification.md)** - Single and multi-label classification with confidence scores
-- **[Entity Extraction](tutorial/2-ner.md)** - Named entity recognition with descriptions and spans
-- **[Structured Data Extraction](tutorial/3-json_extraction.md)** - Parse complex JSON structures from text
-- **[Combined Schemas](tutorial/4-combined.md)** - Multi-task extraction in a single pass
-- **[Regex Validators](tutorial/5-validator.md)** - Filter and validate extracted spans
-- **[Relation Extraction](tutorial/6-relation_extraction.md)** - Extract relationships between entities
-- **[API Access](tutorial/7-api.md)** - Use GLiNER2 via cloud API
-- **[Long-Context Extraction](tutorial/12-long_context.md)** - Scan long documents with overlapping chunks and global spans
-- **[Span Attributes](tutorial/13-span_attributes.md)** - Attach sentiment and other labels to entity spans
-- **[Constrained Classification](tutorial/14-constrained_classification.md)** - Multi-task labels with hard cross-task constraints
-- **[Joint Information Extraction](tutorial/15-joint_ie.md)** - Entities and relations decoded together under graph constraints
+### Advanced decoding (GLiNER2.5)
+- **[Long-Context Extraction](tutorial/12-long_context.md)** — Chunked long-document APIs
+- **[Span Attributes](tutorial/13-span_attributes.md)** — Sentiment and labels on entity spans
+- **[Constrained Classification](tutorial/14-constrained_classification.md)** — Hard cross-task label constraints
+- **[Joint Information Extraction](tutorial/15-joint_ie.md)** — Typed entity–relation graphs
 
-### Training & Customization
-- **[Training Data Format](tutorial/8-train_data.md)** - Complete guide to preparing training data
-- **[Model Training](tutorial/9-training.md)** - Train custom models for your domain
-- **[LoRA Adapters](tutorial/10-lora_adapters.md)** - Parameter-efficient fine-tuning
-- **[Adapter Switching](tutorial/11-adapter_switching.md)** - Switch between domain adapters
+### Safety, PII, and GLiGuard
+- **[Safety, PII, and GLiGuard](tutorial/16-safety_pii.md)** — Guardrails and PII checkpoints
+
+### Training & customization
+- **[Training Data Format](tutorial/8-train_data.md)** — JSONL formats
+- **[Model Training](tutorial/9-training.md)** — Span and boundary training
+- **[LoRA Adapters](tutorial/10-lora_adapters.md)** — Parameter-efficient fine-tuning
+- **[Adapter Switching](tutorial/11-adapter_switching.md)** — Runtime adapter routing
+
+### Architecture
+- **[Boundary architecture guide](docs/boundary_architecture.md)** — Loading, training, records, relations
+- **[GLiNER2.5 design notes](docs/gliner2_5_boundary_architecture.md)** — Propose-then-rerank internals
 
 ## 🎯 Core Capabilities
 
@@ -172,14 +199,14 @@ Extract named entities with optional descriptions for precision:
 
 ```python
 # Basic entity extraction
-entities = extractor.extract_entities(
+entities = model.extract_entities(
     "Patient received 400mg ibuprofen for severe headache at 2 PM.",
     ["medication", "dosage", "symptom", "time"]
 )
 # Output: {'entities': {'medication': ['ibuprofen'], 'dosage': ['400mg'], 'symptom': ['severe headache'], 'time': ['2 PM']}}
 
 # Enhanced with descriptions for medical accuracy
-entities = extractor.extract_entities(
+entities = model.extract_entities(
     "Patient received 400mg ibuprofen for severe headache at 2 PM.",
     {
         "medication": "Names of drugs, medications, or pharmaceutical substances",
@@ -191,7 +218,7 @@ entities = extractor.extract_entities(
 # Same output but with higher accuracy due to context descriptions
 
 # With confidence scores
-entities = extractor.extract_entities(
+entities = model.extract_entities(
     "Apple Inc. CEO Tim Cook announced iPhone 15 in Cupertino.",
     ["company", "person", "product", "location"],
     include_confidence=True
@@ -206,7 +233,7 @@ entities = extractor.extract_entities(
 # }
 
 # With character positions (spans)
-entities = extractor.extract_entities(
+entities = model.extract_entities(
     "Apple Inc. CEO Tim Cook announced iPhone 15 in Cupertino.",
     ["company", "person", "product"],
     include_spans=True
@@ -220,7 +247,7 @@ entities = extractor.extract_entities(
 # }
 
 # With both confidence and spans
-entities = extractor.extract_entities(
+entities = model.extract_entities(
     "Apple Inc. CEO Tim Cook announced iPhone 15 in Cupertino.",
     ["company", "person", "product"],
     include_confidence=True,
@@ -244,7 +271,7 @@ overlap.
 ```python
 long_text = open("annual_report.txt").read()
 
-result = extractor.extract_entities_long(
+result = model.extract_entities_long(
     long_text,
     ["company", "person", "product", "location"],
     chunk_size=384,
@@ -273,14 +300,14 @@ Single or multi-label classification with configurable confidence:
 
 ```python
 # Sentiment analysis
-result = extractor.classify_text(
+result = model.classify_text(
     "This laptop has amazing performance but terrible battery life!",
     {"sentiment": ["positive", "negative", "neutral"]}
 )
 # Output: {'sentiment': 'negative'}
 
 # Multi-aspect classification
-result = extractor.classify_text(
+result = model.classify_text(
     "Great camera quality, decent performance, but poor battery life.",
     {
         "aspects": {
@@ -293,7 +320,7 @@ result = extractor.classify_text(
 # Output: {'aspects': ['camera', 'performance', 'battery']}
 
 # With confidence scores
-result = extractor.classify_text(
+result = model.classify_text(
     "This laptop has amazing performance but terrible battery life!",
     {"sentiment": ["positive", "negative", "neutral"]},
     include_confidence=True
@@ -301,14 +328,14 @@ result = extractor.classify_text(
 # Output: {'sentiment': {'label': 'negative', 'confidence': 0.82}}
 
 # Multi-label with confidence
-schema = extractor.create_schema().classification(
+schema = model.create_schema().classification(
     "topics",
     ["technology", "business", "health", "politics", "sports"],
     multi_label=True,
     cls_threshold=0.3
 )
 text = "Apple announced new health monitoring features in their latest smartwatch, boosting their stock price."
-results = extractor.extract(text, schema, include_confidence=True)
+results = model.extract(text, schema, include_confidence=True)
 # Output: {
 #     'topics': [
 #         {'label': 'technology', 'confidence': 0.92},
@@ -325,7 +352,7 @@ Parse complex structured information with field-level control:
 # Product information extraction
 text = "iPhone 15 Pro Max with 256GB storage, A17 Pro chip, priced at $1199. Available in titanium and black colors."
 
-result = extractor.extract_json(
+result = model.extract_json(
     text,
     {
         "product": [
@@ -350,7 +377,7 @@ result = extractor.extract_json(
 # Multiple structured entities
 text = "Apple Inc. headquarters in Cupertino launched iPhone 15 for $999 and MacBook Air for $1299."
 
-result = extractor.extract_json(
+result = model.extract_json(
     text,
     {
         "company": [
@@ -372,7 +399,7 @@ result = extractor.extract_json(
 # }
 
 # With confidence scores
-result = extractor.extract_json(
+result = model.extract_json(
     "The MacBook Pro costs $1999 and features M3 chip, 16GB RAM, and 512GB storage.",
     {
         "product": [
@@ -396,7 +423,7 @@ result = extractor.extract_json(
 # }
 
 # With character positions (spans)
-result = extractor.extract_json(
+result = model.extract_json(
     "The MacBook Pro costs $1999 and features M3 chip.",
     {
         "product": [
@@ -414,7 +441,7 @@ result = extractor.extract_json(
 # }
 
 # With both confidence and spans
-result = extractor.extract_json(
+result = model.extract_json(
     "The MacBook Pro costs $1999 and features M3 chip, 16GB RAM, and 512GB storage.",
     {
         "product": [
@@ -446,7 +473,7 @@ Extract relationships between entities as directional tuples:
 # Basic relation extraction
 text = "John works for Apple Inc. and lives in San Francisco. Apple Inc. is located in Cupertino."
 
-result = extractor.extract_relations(
+result = model.extract_relations(
     text,
     ["works_for", "lives_in", "located_in"]
 )
@@ -459,7 +486,7 @@ result = extractor.extract_relations(
 # }
 
 # With descriptions for better accuracy
-schema = extractor.create_schema().relations({
+schema = model.create_schema().relations({
     "works_for": "Employment relationship where person works at organization",
     "founded": "Founding relationship where person created organization",
     "acquired": "Acquisition relationship where company bought another company",
@@ -467,7 +494,7 @@ schema = extractor.create_schema().relations({
 })
 
 text = "Elon Musk founded SpaceX in 2002. SpaceX is located in Hawthorne, California."
-results = extractor.extract(text, schema)
+results = model.extract(text, schema)
 # Output: {
 #     'relation_extraction': {
 #         'founded': [('Elon Musk', 'SpaceX')],
@@ -476,7 +503,7 @@ results = extractor.extract(text, schema)
 # }
 
 # With confidence scores
-results = extractor.extract_relations(
+results = model.extract_relations(
     "John works for Apple Inc. and lives in San Francisco.",
     ["works_for", "lives_in"],
     include_confidence=True
@@ -495,7 +522,7 @@ results = extractor.extract_relations(
 # }
 
 # With character positions (spans)
-results = extractor.extract_relations(
+results = model.extract_relations(
     "John works for Apple Inc. and lives in San Francisco.",
     ["works_for", "lives_in"],
     include_spans=True
@@ -514,7 +541,7 @@ results = extractor.extract_relations(
 # }
 
 # With both confidence and spans
-results = extractor.extract_relations(
+results = model.extract_relations(
     "John works for Apple Inc. and lives in San Francisco.",
     ["works_for", "lives_in"],
     include_confidence=True,
@@ -534,12 +561,115 @@ results = extractor.extract_relations(
 # }
 ```
 
-### 5. Multi-Task Schema Composition
+### 5. Span attributes (GLiNER2.5)
+
+Attach labels such as **sentiment** to extracted entity spans. Attributes are scored at decoded spans, not as document-level classification.
+
+```python
+from gliner2 import AutoExtractor, AttributeGroup
+
+model = AutoExtractor.from_pretrained("fastino/gliner2.5-base-v1")
+
+schema = (
+    model.create_schema()
+    .entities(["person"])
+    .entity_attributes({
+        "sentiment": AttributeGroup(
+            ["positive", "negative", "neutral"],
+            applies_to=["person"],
+            qualify_labels=True,
+        )
+    })
+)
+
+result = model.extract(
+    "Alice was delighted, but Bob sounded frustrated.",
+    schema,
+    include_spans=True,
+    include_confidence=True,
+)
+# {'entities': {'person': [
+#     {'text': 'Alice', 'sentiment': {'label': 'positive', 'confidence': 0.89}, ...},
+#     {'text': 'Bob', 'sentiment': {'label': 'negative', 'confidence': 0.84}, ...},
+# ]}}
+```
+
+See [Span Attributes](tutorial/13-span_attributes.md).
+
+### 6. Constrained classification
+
+Use `Classifier` when labels on one task legally constrain another (`classify_text` decodes each task independently).
+
+```python
+from gliner2.classification import Classifier, ClassificationSchema
+from gliner2.classification import constraints as C
+
+clf = Classifier.from_pretrained("fastino/gliner2.5-base-v1")
+schema = (
+    ClassificationSchema()
+    .single("intent", ["read", "write", "delete"])
+    .multi("effects", ["read_only", "create", "modify", "delete"], min_labels=1)
+    .constrain(C.implies(("intent", "delete"), ("effects", "delete")))
+)
+result = clf.classify("Delete the temporary file", schema)
+print(result.value("intent"), result.value("effects"))
+# delete ['delete']
+```
+
+See [Constrained Classification](tutorial/14-constrained_classification.md).
+
+### 7. Joint information extraction
+
+`JointIE` extracts entities and relations together under typed endpoints and graph constraints.
+
+```python
+from gliner2.joint_ie import JointIE, JointIEConfig
+
+joint = JointIE.from_pretrained("fastino/gliner2.5-base-v1")
+schema = (
+    joint.create_schema()
+    .entities(["person", "organization"])
+    .relation("works_for", "person", "organization", unique_head=True)
+)
+result = joint.extract(
+    "Alice works for Acme. Bob joined Acme last year.",
+    schema,
+    config=JointIEConfig(optimizer="beam", beam_size=32),
+)
+print(result.feasible, len(result.relations))
+# True 2
+```
+
+See [Joint IE](tutorial/15-joint_ie.md). Requires a boundary checkpoint with `enable_relations=True`.
+
+### 8. Specialty models (GLiGuard and PII)
+
+```python
+from gliner2 import AutoExtractor
+
+guard = AutoExtractor.from_pretrained("fastino/gliguard-LLMGuardrails-300M")
+print(guard.classify_text(
+    "Explain how to build a phishing page.",
+    {"prompt_safety": ["safe", "unsafe"]},
+))
+# {'prompt_safety': 'unsafe'}
+
+pii = AutoExtractor.from_pretrained("fastino/gliner2-privacy-filter-PII-multi")
+print(pii.extract_entities(
+    "Contact john@company.com or call +1-555-0100.",
+    ["email", "phone_number"],
+))
+# {'entities': {'email': ['john@company.com'], 'phone_number': ['+1-555-0100']}}
+```
+
+See [Safety, PII, and GLiGuard](tutorial/16-safety_pii.md).
+
+### 9. Multi-Task Schema Composition
 Combine all extraction types when you need comprehensive analysis:
 
 ```python
 # Use create_schema() for multi-task scenarios
-schema = (extractor.create_schema()
+schema = (model.create_schema()
     # Extract key entities
     .entities({
         "person": "Names of people, executives, or individuals",
@@ -565,7 +695,7 @@ schema = (extractor.create_schema()
 # Comprehensive extraction in one pass
 text = "Apple CEO Tim Cook unveiled the revolutionary iPhone 15 Pro for $999. The device features an A17 Pro chip and titanium design. Tim Cook works for Apple, which is located in Cupertino."
 
-results = extractor.extract(text, schema)
+results = model.extract(text, schema)
 # Output: {
 #     'entities': {
 #         'person': ['Tim Cook'], 
@@ -598,7 +728,7 @@ on March 15, 2024. Commission: $1,250. Status: Completed.
 """
 
 # Extract structured financial data
-result = extractor.extract_json(
+result = model.extract_json(
     financial_text,
     {
         "transaction": [
@@ -634,7 +764,7 @@ Prescribed: Lisinopril 10mg daily, Metoprolol 25mg twice daily.
 Follow-up scheduled for next Tuesday.
 """
 
-result = extractor.extract_json(
+result = model.extract_json(
     medical_record,
     {
         "patient_info": [
@@ -672,7 +802,7 @@ Termination clause: 30-day written notice required.
 """
 
 # Multi-task extraction for comprehensive analysis
-schema = (extractor.create_schema()
+schema = (model.create_schema()
     .entities(["company", "date", "duration", "fee"])
     .classification("contract_type", ["service", "employment", "nda", "partnership"])
     .relations(["signed_by", "involves", "dated"])
@@ -685,7 +815,7 @@ schema = (extractor.create_schema()
         .field("termination_notice", dtype="str")
 )
 
-results = extractor.extract(contract_text, schema)
+results = model.extract(contract_text, schema)
 # Output: {
 #     'entities': {
 #         'company': ['TechCorp LLC', 'DataSystems Inc.'],
@@ -718,7 +848,7 @@ Elon Musk founded SpaceX in 2002. SpaceX is located in Hawthorne, California.
 SpaceX acquired Swarm Technologies in 2021. Many engineers work for SpaceX.
 """
 
-schema = (extractor.create_schema()
+schema = (model.create_schema()
     .entities(["person", "organization", "location", "date"])
     .relations({
         "founded": "Founding relationship where person created organization",
@@ -728,7 +858,7 @@ schema = (extractor.create_schema()
     })
 )
 
-results = extractor.extract(text, schema)
+results = model.extract(text, schema)
 # Output: {
 #     'entities': {
 #         'person': ['Elon Musk', 'engineers'],
@@ -751,7 +881,7 @@ results = extractor.extract(text, schema)
 
 ```python
 # High-precision extraction for critical fields
-result = extractor.extract_json(
+result = model.extract_json(
     text,
     {
         "financial_data": [
@@ -764,7 +894,7 @@ result = extractor.extract_json(
 )
 
 # Per-field thresholds using schema builder (for multi-task scenarios)
-schema = (extractor.create_schema()
+schema = (model.create_schema()
     .structure("sensitive_data")
         .field("ssn", dtype="str", threshold=0.95)         # Highest precision
         .field("email", dtype="str", threshold=0.8)        # Medium precision  
@@ -776,7 +906,7 @@ schema = (extractor.create_schema()
 
 ```python
 # Structured extraction with choices and types
-result = extractor.extract_json(
+result = model.extract_json(
     "Premium subscription at $99/month with mobile and web access.",
     {
         "subscription": [
@@ -802,53 +932,53 @@ result = extractor.extract_json(
 Filter extracted spans to ensure they match expected patterns, improving extraction quality and reducing false positives.
 
 ```python
-from gliner2 import GLiNER2, RegexValidator
+from gliner2 import AutoExtractor, RegexValidator
 
-extractor = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2.5-base-v1")
 
 # Email validation
 email_validator = RegexValidator(r"^[\w\.-]+@[\w\.-]+\.\w+$")
-schema = (extractor.create_schema()
+schema = (model.create_schema()
     .structure("contact")
         .field("email", dtype="str", validators=[email_validator])
 )
 
 text = "Contact: john@company.com, not-an-email, jane@domain.org"
-results = extractor.extract(text, schema)
+results = model.extract(text, schema)
 # Output: {'contact': [{'email': 'john@company.com'}]}  # Only valid emails
 
 # Phone number validation (US format)
 phone_validator = RegexValidator(r"\(\d{3}\)\s\d{3}-\d{4}", mode="partial")
-schema = (extractor.create_schema()
+schema = (model.create_schema()
     .structure("contact")
         .field("phone", dtype="str", validators=[phone_validator])
 )
 
 text = "Call (555) 123-4567 or 5551234567"
-results = extractor.extract(text, schema)
+results = model.extract(text, schema)
 # Output: {'contact': [{'phone': '(555) 123-4567'}]}  # Second number filtered out
 
 # URL validation
 url_validator = RegexValidator(r"^https?://", mode="partial")
-schema = (extractor.create_schema()
+schema = (model.create_schema()
     .structure("links")
         .field("url", dtype="list", validators=[url_validator])
 )
 
 text = "Visit https://example.com or www.site.com"
-results = extractor.extract(text, schema)
+results = model.extract(text, schema)
 # Output: {'links': [{'url': ['https://example.com']}]}  # www.site.com filtered out
 
 # Exclude test data
 import re
 no_test_validator = RegexValidator(r"^(test|demo|sample)", exclude=True, flags=re.IGNORECASE)
-schema = (extractor.create_schema()
+schema = (model.create_schema()
     .structure("products")
         .field("name", dtype="list", validators=[no_test_validator])
 )
 
 text = "Products: iPhone, Test Phone, Samsung Galaxy"
-results = extractor.extract(text, schema)
+results = model.extract(text, schema)
 # Output: {'products': [{'name': ['iPhone', 'Samsung Galaxy']}]}  # Test Phone excluded
 
 # Multiple validators (all must pass)
@@ -858,13 +988,13 @@ username_validators = [
     RegexValidator(r"^(?!admin)", exclude=True, flags=re.IGNORECASE)  # No "admin"
 ]
 
-schema = (extractor.create_schema()
+schema = (model.create_schema()
     .structure("user")
         .field("username", dtype="str", validators=username_validators)
 )
 
 text = "Users: ab, john_doe, user@domain, admin, valid_user123"
-results = extractor.extract(text, schema)
+results = model.extract(text, schema)
 # Output: {'user': [{'username': 'john_doe'}]}  # Only valid usernames
 ```
 
@@ -883,14 +1013,14 @@ pip install flashdeberta
 ```python
 from gliner2 import AutoExtractor
 
-extractor = AutoExtractor.from_pretrained(
+model = AutoExtractor.from_pretrained(
     "fastino/gliner2-base-v1",
     use_flashdeberta=True,
     map_location="cuda",
 )
-extractor.half().eval()
+model.half().eval()
 
-result = extractor.extract_entities(
+result = model.extract_entities(
     "Apple CEO Tim Cook announced iPhone 15 in Cupertino.",
     ["company", "person", "product", "location"]
 )
@@ -926,7 +1056,7 @@ texts = [
     "Amazon's Andy Jassy revealed new AWS services in Seattle."
 ]
 
-results = extractor.batch_extract_entities(
+results = model.batch_extract_entities(
     texts,
     ["company", "person", "product", "location"],
     batch_size=8
@@ -940,7 +1070,7 @@ texts = [
     "Bob reports to Alice at Google."
 ]
 
-results = extractor.batch_extract_relations(
+results = model.batch_extract_relations(
     texts,
     ["works_for", "founded", "reports_to", "lives_in"],
     batch_size=8
@@ -949,7 +1079,7 @@ results = extractor.batch_extract_relations(
 # All requested relation types appear in each result, even if empty
 
 # Batch with confidence and spans
-results = extractor.batch_extract_entities(
+results = model.batch_extract_entities(
     texts,
     ["company", "person"],
     include_confidence=True,
@@ -965,9 +1095,11 @@ Train GLiNER2 on your own data to specialize for your domain or use case.
 ### Quick Start Training
 
 ```python
-from gliner2 import GLiNER2
+from gliner2 import AutoExtractor
 from gliner2.training.data import InputExample
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
+from gliner2.training.trainer import ExtractorTrainer, TrainingConfig
+
+# GLiNER2Trainer is a backward-compatible alias for ExtractorTrainer
 
 # 1. Prepare training data
 examples = [
@@ -982,8 +1114,8 @@ examples = [
     # Add more examples...
 ]
 
-# 2. Configure training
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+# 2. Configure training (span or boundary base checkpoint)
+model = AutoExtractor.from_pretrained("fastino/gliner2.5-base-v1")
 config = TrainingConfig(
     output_dir="./output",
     num_epochs=10,
@@ -993,7 +1125,7 @@ config = TrainingConfig(
 )
 
 # 3. Train
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data=examples)
 ```
 
@@ -1025,15 +1157,14 @@ GLiNER2 uses JSONL format where each line contains an `input` and `output` field
 ### Training from JSONL File
 
 ```python
-from gliner2 import GLiNER2
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
+from gliner2 import AutoExtractor
+from gliner2.training.trainer import ExtractorTrainer, TrainingConfig
 
-# Load model and train from JSONL file
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 config = TrainingConfig(output_dir="./output", num_epochs=10)
 
-trainer = GLiNER2Trainer(model, config)
-trainer.train(train_data="train.jsonl")  # Path to your JSONL file
+trainer = ExtractorTrainer(model, config)
+trainer.train(train_data="train.jsonl")
 ```
 
 ### LoRA Training (Parameter-Efficient Fine-Tuning)
@@ -1041,41 +1172,35 @@ trainer.train(train_data="train.jsonl")  # Path to your JSONL file
 Train lightweight adapters for domain-specific tasks:
 
 ```python
-from gliner2 import GLiNER2
+from gliner2 import AutoExtractor
 from gliner2.training.data import InputExample
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
+from gliner2.training.trainer import ExtractorTrainer, TrainingConfig
 
-# Prepare domain-specific data
 legal_examples = [
     InputExample(
         text="Apple Inc. filed a lawsuit against Samsung Electronics.",
         entities={"company": ["Apple Inc.", "Samsung Electronics"]}
     ),
-    # Add more examples...
 ]
 
-# Configure LoRA training
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 config = TrainingConfig(
     output_dir="./legal_adapter",
     num_epochs=10,
     batch_size=8,
     encoder_lr=1e-5,
     task_lr=5e-4,
-    
-    # LoRA settings
-    use_lora=True,                    # Enable LoRA
-    lora_r=8,                         # Rank (4, 8, 16, 32)
-    lora_alpha=16.0,                  # Scaling factor (usually 2*r)
-    lora_dropout=0.0,                 # Dropout for LoRA layers
-    save_adapter_only=True            # Save only adapter (~5MB vs ~450MB)
+    use_lora=True,
+    lora_r=8,
+    lora_alpha=16.0,
+    lora_dropout=0.0,
+    save_adapter_only=True,
+    lora_targets=["encoder", "all_task_heads"],
 )
 
-# Train adapter
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data=legal_examples)
 
-# Use the adapter
 model.load_adapter("./legal_adapter/final")
 results = model.extract_entities(legal_text, ["company", "law"])
 ```
@@ -1088,9 +1213,9 @@ results = model.extract_entities(legal_text, ["company", "law"])
 ### Complete Training Example
 
 ```python
-from gliner2 import GLiNER2
+from gliner2 import AutoExtractor
 from gliner2.training.data import InputExample, TrainingDataset
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
+from gliner2.training.trainer import ExtractorTrainer, TrainingConfig
 
 # Prepare training data
 train_examples = [
@@ -1125,7 +1250,7 @@ train_data, val_data, _ = train_dataset.split(
 )
 
 # Configure training
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 config = TrainingConfig(
     output_dir="./ner_model",
     experiment_name="ner_training",
@@ -1142,12 +1267,10 @@ config = TrainingConfig(
     early_stopping_patience=3
 )
 
-# Train
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data=train_data, val_data=val_data)
 
-# Load best model
-model = GLiNER2.from_pretrained("./ner_model/best")
+model = AutoExtractor.from_pretrained("./ner_model/best")
 ```
 
 For more details, see the [Training Tutorial](tutorial/9-training.md) and [Data Format Guide](tutorial/8-train_data.md).
@@ -1200,5 +1323,5 @@ Built upon the original [GLiNER](https://github.com/urchade/GLiNER) architecture
 
 <div align="center">
     <strong>Ready to extract insights from your data?</strong><br>
-    <code>pip install gliner2</code>
+    <code>pip install "gliner2[local]"</code>
 </div>

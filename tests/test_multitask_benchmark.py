@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from benchmarks.multitask.adapters import (
     Example,
     LoadedSplit,
@@ -49,7 +51,11 @@ from benchmarks.multitask.normalize import (
     tokens_to_text,
 )
 from benchmarks.multitask.sampling import cap_examples
-from benchmarks.multitask.train_corpus import to_training_example, validate_train_split
+from benchmarks.multitask.train_corpus import (
+    to_training_example,
+    training_specs,
+    validate_train_split,
+)
 
 
 def test_display_and_canonical_labels():
@@ -62,6 +68,19 @@ def test_display_and_canonical_labels():
     assert display_label("en") == "english"
     assert display_label("CPR:3") == "upregulator"
     assert canonical_label("Card_Arrival") == "card arrival"
+
+
+def test_training_specs_filter_tasks_and_reject_unknown():
+    specs = training_specs(["classification", "ner"])
+    assert len(specs) == 30
+    assert {spec.task for spec in specs} == {"classification", "ner"}
+    assert [spec.id for spec in specs] == [
+        spec.id
+        for spec in DATASETS.values()
+        if spec.task in {"classification", "ner"}
+    ]
+    with pytest.raises(ValueError, match="unknown training task"):
+        training_specs(["generation"])
 
 
 def test_tokens_to_text_offsets_roundtrip():
@@ -182,14 +201,30 @@ def test_redocred_cluster_mapping():
     assert mapped == {(0, "founded", 1)}
 
 
-def test_catalog_has_thirty_four_datasets():
-    assert len(DATASETS) == 34
+def test_catalog_has_forty_datasets():
+    assert len(DATASETS) == 40
     assert len(MODELS) == 5
-    assert sum(spec.task == "classification" for spec in DATASETS.values()) == 12
-    assert sum(spec.task == "ner" for spec in DATASETS.values()) == 12
+    assert sum(spec.task == "classification" for spec in DATASETS.values()) == 13
+    assert sum(spec.task == "ner" for spec in DATASETS.values()) == 17
     assert sum(spec.task == "relation" for spec in DATASETS.values()) == 10
     assert DATASETS["wikineural"].train_split == "train_en"
     assert DATASETS["tweet_topic_multi"].train_split == "train_2021"
+    assert DATASETS["sst2"].test_split == "validation"
+    assert DATASETS["sst2"].extra["text"] == "sentence"
+    for domain, config in [
+        ("ai", "ai"),
+        ("literature", "literature"),
+        ("music", "music"),
+        ("politics", "politics"),
+        ("science", "science"),
+    ]:
+        spec = DATASETS[f"crossner_{domain}"]
+        assert spec.path == "DFKI-SLT/cross_ner"
+        assert spec.config == config
+        assert spec.loader == "ner_bio"
+        assert spec.train_split == "train"
+        assert spec.test_split == "test"
+        assert spec.extra.get("trust_remote_code") is True
     assert all(spec.train_split != spec.test_split for spec in DATASETS.values())
     assert all(
         spec.train_split != spec.validation_split
@@ -371,6 +406,12 @@ def test_finetune_config_is_full_and_step_bounded(tmp_path: Path):
     assert not config.save_adapter_only
     assert config.allow_invalid_samples
     assert not config.fp16 and not config.bf16
+
+
+def test_unload_model_accepts_none():
+    from benchmarks.multitask.run import _unload_model
+
+    _unload_model(None)
 
 
 def test_resume_skips_complete_shards(tmp_path: Path):

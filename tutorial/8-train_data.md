@@ -2,6 +2,8 @@
 
 GLiNER2 uses JSONL format where each line contains an `input` and `output` field (or alternatively `text` and `schema`). The `input`/`text` is the text to process, and the `output`/`schema` is the schema with labels/annotations.
 
+Training data covers **entities, classifications, json structures, and relations**. The same JSONL format is used for span and boundary (`GLiNER2.5`) models. Span-attribute labels are inferred at inference from entity spans; there is no separate attribute field in JSONL yet.
+
 ## Quick Format Reference
 
 ### General Structure

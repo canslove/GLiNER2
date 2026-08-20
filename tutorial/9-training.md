@@ -2,6 +2,8 @@
 
 Complete guide to training GLiNER2 models for entity extraction, classification, structured data extraction, and relation extraction.
 
+Load checkpoints with `AutoExtractor.from_pretrained(...)` — it works for both span and boundary bases. `ExtractorTrainer` is the trainer class (`GLiNER2Trainer` is a backward-compatible alias).
+
 ## Table of Contents
 
 1. [Quick Start](#quick-start)
@@ -19,9 +21,9 @@ Complete guide to training GLiNER2 models for entity extraction, classification,
 ### Minimal Example
 
 ```python
-from gliner2 import GLiNER2
+from gliner2 import AutoExtractor
 from gliner2.training.data import InputExample
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
+from gliner2.training.trainer import ExtractorTrainer, TrainingConfig
 
 # 1. Create training examples
 examples = [
@@ -36,7 +38,8 @@ examples = [
 ]
 
 # 2. Initialize model and config
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+# Span legacy: fastino/gliner2-base-v1 | Boundary: fastino/gliner2.5-base-v1
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 config = TrainingConfig(
     output_dir="./output",
     num_epochs=10,
@@ -46,7 +49,7 @@ config = TrainingConfig(
 )
 
 # 3. Train
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data=examples)
 ```
 
@@ -56,13 +59,13 @@ trainer.train(train_data=examples)
 # Create train.jsonl file with format:
 # {"input": "text here", "output": {"entities": {"type": ["mention1", "mention2"]}}}
 
-from gliner2 import GLiNER2
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
+from gliner2 import AutoExtractor
+from gliner2.training.trainer import ExtractorTrainer, TrainingConfig
 
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 config = TrainingConfig(output_dir="./output", num_epochs=10)
 
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data="train.jsonl")
 ```
 
@@ -73,9 +76,9 @@ trainer.train(train_data="train.jsonl")
 ### Example 1: Complete NER Training Pipeline
 
 ```python
-from gliner2 import GLiNER2
+from gliner2 import AutoExtractor
 from gliner2.training.data import InputExample, TrainingDataset
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
+from gliner2.training.trainer import ExtractorTrainer, TrainingConfig
 
 # Step 1: Prepare training data
 train_examples = [
@@ -127,7 +130,7 @@ train_data.save("train.jsonl")
 val_data.save("val.jsonl")
 
 # Step 5: Configure training
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 config = TrainingConfig(
     output_dir="./ner_model",
     experiment_name="ner_training",
@@ -147,7 +150,7 @@ config = TrainingConfig(
 )
 
 # Step 6: Train
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 results = trainer.train(
     train_data=train_data,
     eval_data=val_data
@@ -159,15 +162,15 @@ print(f"Total steps: {results['total_steps']}")
 print(f"Training time: {results['total_time_seconds']/60:.1f} minutes")
 
 # Step 7: Load best model for inference
-best_model = GLiNER2.from_pretrained("./ner_model/best")
+best_model = AutoExtractor.from_pretrained("./ner_model/best")
 ```
 
 ### Example 2: Multi-Task Training (NER + Classification + Relations)
 
 ```python
-from gliner2 import GLiNER2
+from gliner2 import AutoExtractor
 from gliner2.training.data import InputExample, Classification, Relation
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
+from gliner2.training.trainer import ExtractorTrainer, TrainingConfig
 
 # Create multi-task examples
 examples = [
@@ -194,7 +197,7 @@ examples = [
 ]
 
 # Train multi-task model
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 config = TrainingConfig(
     output_dir="./multitask_model",
     num_epochs=20,
@@ -203,16 +206,16 @@ config = TrainingConfig(
     task_lr=5e-4
 )
 
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data=examples)
 ```
 
 ### Example 3: Domain-Specific Fine-tuning (Medical NER)
 
 ```python
-from gliner2 import GLiNER2
+from gliner2 import AutoExtractor
 from gliner2.training.data import InputExample, TrainingDataset
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
+from gliner2.training.trainer import ExtractorTrainer, TrainingConfig
 
 # Medical domain examples
 medical_examples = [
@@ -244,7 +247,7 @@ medical_examples = [
 ]
 
 # Fine-tune on medical domain
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 config = TrainingConfig(
     output_dir="./medical_ner",
     num_epochs=20,
@@ -254,7 +257,7 @@ config = TrainingConfig(
     warmup_ratio=0.05
 )
 
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data=medical_examples)
 ```
 
@@ -712,11 +715,11 @@ GLiNER2 supports both coarse-grained (module groups) and fine-grained (specific 
 ### Basic LoRA Training
 
 ```python
-from gliner2 import GLiNER2
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
+from gliner2 import AutoExtractor
+from gliner2.training.trainer import ExtractorTrainer, TrainingConfig
 
 # Load base model
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 
 # Configure LoRA training
 config = TrainingConfig(
@@ -743,11 +746,11 @@ config = TrainingConfig(
 )
 
 # Train with LoRA
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 results = trainer.train(train_data="train.jsonl", eval_data="val.jsonl")
 
 # Checkpoints contain merged weights (ready for inference)
-best_model = GLiNER2.from_pretrained("./output_lora/best")
+best_model = AutoExtractor.from_pretrained("./output_lora/best")
 ```
 
 ### LoRA Configuration Parameters
@@ -824,7 +827,7 @@ config = TrainingConfig(
     fp16=True
 )
 
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data="train.jsonl")
 ```
 
@@ -844,7 +847,7 @@ config = TrainingConfig(
     num_epochs=15
 )
 
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data="train.jsonl")
 ```
 
@@ -864,7 +867,7 @@ config = TrainingConfig(
     warmup_ratio=0.05
 )
 
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data=medical_examples)
 ```
 
@@ -892,7 +895,7 @@ trainer.train(train_data=medical_examples)
 
 ```python
 # Load model from checkpoint (for inference or continued training)
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 
 # Load checkpoint (weights are merged in checkpoint)
 trainer.load_checkpoint("./output_lora/checkpoint-1000")
@@ -923,7 +926,7 @@ def compute_metrics(model, eval_dataset):
     
     return metrics
 
-trainer = GLiNER2Trainer(
+trainer = ExtractorTrainer(
     model=model,
     config=config,
     compute_metrics=compute_metrics
@@ -935,7 +938,7 @@ trainer.train(train_data=examples, eval_data=eval_examples)
 ### Loading Checkpoints
 
 ```python
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 
 # Load checkpoint (model weights only, no optimizer state)
 trainer.load_checkpoint("./output/checkpoint-1000")
@@ -960,7 +963,7 @@ config = TrainingConfig(
     local_rank=int(os.environ.get("LOCAL_RANK", -1))  # Auto-detect DDP
 )
 
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data=examples)
 ```
 
@@ -1006,7 +1009,7 @@ config = TrainingConfig(
     wandb_notes="Testing new architecture"
 )
 
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data=examples)
 # Metrics automatically logged to W&B
 ```
