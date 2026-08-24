@@ -31,7 +31,13 @@ HUB_LOAD_OPTIONS = frozenset(
     }
 )
 MODEL_LOAD_OPTIONS = frozenset(
-    {"quantize", "compile", "map_location", "use_flashdeberta"}
+    {
+        "quantize",
+        "compile",
+        "map_location",
+        "use_flashdeberta",
+        "word_splitter",
+    }
 )
 LOAD_OPTIONS = HUB_LOAD_OPTIONS | MODEL_LOAD_OPTIONS
 

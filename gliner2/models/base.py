@@ -222,3 +222,25 @@ class BaseExtractorModel(PreTrainedModel):
         self.config.architecture = getattr(self, "architecture", self.config.architecture)
         self.config.architectures = [type(self).__name__]
         return super().save_pretrained(*args, **kwargs)
+
+    def set_word_splitter(self, word_splitter):
+        """Replace the word splitter used at inference and training collation.
+
+        ``word_splitter`` may be a built-in name (``"whitespace"`` or
+        ``"char"``) or a callable yielding ``(token, start, end)`` with
+        exclusive-end offsets into the original text. The default
+        ``"whitespace"`` strategy is the one used to train public checkpoints.
+
+        ``"char"`` is suitable for languages without whitespace-delimited
+        words, such as Chinese. Changing a pretrained model's word boundaries
+        can affect quality unless training used the same splitter.
+        """
+        from gliner2.processing.word_splitter import resolve_word_splitter
+
+        processor = getattr(self, "processor", None)
+        if processor is None:
+            raise AttributeError(
+                f"{type(self).__name__} has no processor to attach a word splitter to"
+            )
+        processor.word_splitter = resolve_word_splitter(word_splitter)
+        return self

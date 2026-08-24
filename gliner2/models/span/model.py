@@ -75,6 +75,7 @@ class SpanExtractorModel(BaseExtractorModel):
         encoder_config=None,
         tokenizer=None,
         use_flashdeberta: Optional[bool] = None,
+        word_splitter=None,
     ):
         super().__init__(config)
         self.config = config
@@ -84,12 +85,14 @@ class SpanExtractorModel(BaseExtractorModel):
         if tokenizer is not None:
             self.processor = SchemaTransformer(
                 tokenizer=tokenizer,
-                token_pooling=config.token_pooling
+                token_pooling=config.token_pooling,
+                word_splitter=word_splitter,
             )
         else:
             self.processor = SchemaTransformer(
                 config.model_name,
-                token_pooling=config.token_pooling
+                token_pooling=config.token_pooling,
+                word_splitter=word_splitter,
             )
 
         # Load encoder
@@ -656,6 +659,9 @@ class SpanExtractorModel(BaseExtractorModel):
             use_flashdeberta: If True, use the optional FlashDeBERTa backend
                 for a compatible DeBERTaV2 encoder. If omitted, defer to the
                 ``USE_FLASHDEBERTA`` environment variable.
+            word_splitter: Built-in splitter name (``"whitespace"`` default,
+                or ``"char"``) or a custom callable. Runtime-only; saved
+                checkpoints reload with the default unless supplied again.
             **kwargs: Additional keyword arguments.
 
         To use a LoRA adapter:
@@ -674,6 +680,7 @@ class SpanExtractorModel(BaseExtractorModel):
         compile_model = model_options.pop("compile", False)
         map_location = model_options.pop("map_location", None)
         use_flashdeberta = model_options.pop("use_flashdeberta", None)
+        word_splitter = model_options.pop("word_splitter", None)
 
         if config is None:
             config_path = checkpoint_file(repo_or_dir, "config.json", hub_kwargs)
@@ -695,6 +702,7 @@ class SpanExtractorModel(BaseExtractorModel):
             encoder_config=encoder_config,
             tokenizer=tokenizer,
             use_flashdeberta=use_flashdeberta,
+            word_splitter=word_splitter,
         )
 
         state_dict = load_checkpoint_state_dict(repo_or_dir, hub_kwargs)

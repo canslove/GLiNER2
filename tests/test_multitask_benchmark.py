@@ -12,6 +12,7 @@ from benchmarks.multitask.adapters import (
     _as_index,
     _as_records,
     _id_entity_relations,
+    _ner_from_tokens,
     _offset_pair,
     _span_tokens,
     _token_pos,
@@ -111,6 +112,46 @@ def test_flat_tags_and_type_map():
         type_map={"pers": "person", "org": "organization"},
     )
     assert [span[2] for span in spans] == ["person", "organization"]
+
+
+def _toy_ner_spec(**extra):
+    payload = {"tokens": "tokens", "tags": "ner_tags", "style": "bio"}
+    payload.update(extra)
+    return DatasetSpec(
+        id="toy_ner",
+        task="ner",
+        path="toy",
+        loader="ner_bio",
+        test_split="test",
+        language="en",
+        license="other",
+        caveats="",
+        extra=payload,
+    )
+
+
+def test_ner_drops_misc_and_keeps_person():
+    example = _ner_from_tokens(
+        _toy_ner_spec(),
+        {
+            "tokens": ["Barack", "Obama", "likes", "jazz"],
+            "ner_tags": ["B-PER", "I-PER", "O", "B-MISC"],
+        },
+        None,
+    )
+    assert example.gold_spans == [(0, 12, "person")]
+
+
+def test_ner_drops_miscellaneous_and_dataset_excludes():
+    example = _ner_from_tokens(
+        _toy_ner_spec(exclude_types=["trigger"]),
+        {
+            "tokens": ["Paris", "flood", "jazz"],
+            "ner_tags": ["B-LOC", "B-trigger", "B-miscellaneous"],
+        },
+        None,
+    )
+    assert example.gold_spans == [(0, 5, "location")]
 
 
 def test_find_span_casefold():

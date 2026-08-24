@@ -18,10 +18,12 @@ import pytest
 import torch
 
 from gliner2.processor import (
+    CharLevelSplitter,
     PreprocessedBatch,
     SchemaTransformer,
     SamplingConfig,
     WhitespaceTokenSplitter,
+    resolve_word_splitter,
 )
 from tests.fixtures.tiny_tokenizer import build_tiny_tokenizer
 
@@ -124,6 +126,72 @@ class TestWhitespaceTokenSplitter:
         tokens = list(splitter("email foo@bar.com now", lower=True))
         emails = [t[0] for t in tokens if "@" in t[0] and "." in t[0]]
         assert len(emails) == 1
+
+
+class TestCharLevelSplitter:
+    def test_keeps_latin_words_together(self):
+        splitter = CharLevelSplitter()
+        tokens = list(splitter("Hello 世界", lower=False))
+        assert tokens[0] == ("Hello", 0, 5)
+        assert [t[0] for t in tokens[1:]] == ["世", "界"]
+
+    def test_chinese_character_boundaries(self):
+        splitter = CharLevelSplitter()
+        text = "我爱北京Tiananmen"
+        tokens = list(splitter(text, lower=False))
+        words = [t[0] for t in tokens]
+        assert words == ["我", "爱", "北", "京", "Tiananmen"]
+        for tok, start, end in tokens:
+            assert text[start:end] == tok
+
+    def test_does_not_lowercase_source_before_matching(self):
+        splitter = CharLevelSplitter()
+        text = "İA"
+        tokens = list(splitter(text, lower=True))
+        assert text[tokens[0][1]:tokens[0][2]] == "İ"
+        assert text[tokens[1][1]:tokens[1][2]] == "A"
+
+
+class TestResolveWordSplitter:
+    def test_none_and_whitespace_name_are_default(self):
+        default = resolve_word_splitter(None)
+        named = resolve_word_splitter("whitespace")
+        assert isinstance(default, WhitespaceTokenSplitter)
+        assert isinstance(named, WhitespaceTokenSplitter)
+
+    def test_char_name_and_class(self):
+        assert isinstance(resolve_word_splitter("char"), CharLevelSplitter)
+        assert isinstance(resolve_word_splitter(CharLevelSplitter), CharLevelSplitter)
+
+    def test_unknown_name_lists_supported_values(self):
+        with pytest.raises(ValueError, match="Supported names"):
+            resolve_word_splitter("bytes")
+
+    def test_rejects_non_callable(self):
+        with pytest.raises(TypeError, match="callable"):
+            resolve_word_splitter(123)
+
+    def test_custom_callable_is_returned(self):
+        def custom(text, lower=True):
+            yield text, 0, len(text)
+
+        assert resolve_word_splitter(custom) is custom
+
+
+class TestSchemaTransformerWordSplitter:
+    def test_default_is_whitespace(self, tokenizer):
+        processor = SchemaTransformer(tokenizer=tokenizer)
+        assert isinstance(processor.word_splitter, WhitespaceTokenSplitter)
+
+    def test_char_name_injection(self, tokenizer):
+        processor = SchemaTransformer(tokenizer=tokenizer, word_splitter="char")
+        assert isinstance(processor.word_splitter, CharLevelSplitter)
+
+    def test_callable_injection(self, tokenizer):
+        processor = SchemaTransformer(
+            tokenizer=tokenizer, word_splitter=CharLevelSplitter()
+        )
+        assert isinstance(processor.word_splitter, CharLevelSplitter)
 
 
 # ===========================================================================

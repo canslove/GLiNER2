@@ -8,12 +8,18 @@ via DataLoader collate functions for parallel preprocessing.
 import copy
 import logging
 import random
-import re
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Dict, Tuple, Iterator, List, Optional
+from typing import Any, Dict, Tuple, List, Optional
 import torch
 from transformers import AutoTokenizer
+
+from gliner2.processing.word_splitter import (  # noqa: F401 - public re-exports
+    CharLevelSplitter,
+    WhitespaceTokenSplitter,
+    WordSplitterSpec,
+    resolve_word_splitter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -224,28 +230,8 @@ class PreprocessedBatch:
 # Tokenizer
 # =============================================================================
 
-class WhitespaceTokenSplitter:
-    """Fast regex-based tokenizer for text splitting."""
-    __slots__ = ()
-
-    _PATTERN = re.compile(
-        r"""(?:https?://[^\s]+|www\.[^\s]+)
-        |[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}
-        |@[a-z0-9_]+
-        |\w+(?:[-_]\w+)*
-        |\S""",
-        re.VERBOSE | re.IGNORECASE,
-    )
-
-    def __call__(self, text: str, lower: bool = True) -> Iterator[Tuple[str, int, int]]:
-        # Match against the original text (the pattern is already case-insensitive)
-        # so offsets index the caller's string, then lower-case only the token
-        # value. Lower-casing the text first is unsafe because Unicode case
-        # folding can change length (e.g. "İ".lower() -> "i\u0307"), which would
-        # corrupt the recorded start/end offsets.
-        for m in self._PATTERN.finditer(text):
-            token = m.group()
-            yield (token.lower() if lower else token), m.start(), m.end()
+# Word splitters live in ``gliner2.processing.word_splitter`` so long-document
+# chunking can reuse them without importing the torch-backed processor.
 
 
 # =============================================================================
@@ -286,6 +272,12 @@ class SchemaTransformer:
 
     Provides efficient batch preprocessing via collate functions
     for parallel DataLoader preprocessing.
+
+    ``word_splitter`` may be ``None`` (default ``"whitespace"``), a built-in
+    name (``"whitespace"`` or ``"char"``), or a callable yielding
+    ``(token, start, end)`` with exclusive-end offsets into the original text.
+    ``"char"`` is suitable for languages without whitespace-delimited words,
+    such as Chinese.
     """
 
     # Special tokens
@@ -310,14 +302,15 @@ class SchemaTransformer:
             model_name: str = None,
             tokenizer=None,
             sampling_config: SamplingConfig = None,
-            token_pooling: str = "first"
+            token_pooling: str = "first",
+            word_splitter: Optional[WordSplitterSpec] = None,
     ):
         if model_name is None and tokenizer is None:
             raise ValueError("Either model_name or tokenizer must be provided.")
 
         self.token_pooling = token_pooling if token_pooling in ["first", "mean", "max"] else "first"
         self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(model_name)
-        self.word_splitter = WhitespaceTokenSplitter()
+        self.word_splitter = resolve_word_splitter(word_splitter)
         self.sampling_config = sampling_config or SamplingConfig()
         self.is_training = False
 

@@ -30,6 +30,7 @@ from gliner2.inference.schema import (  # noqa: F401 - compatibility exports
 )
 from gliner2.processor import PreprocessedBatch
 from gliner2.inference.chunking import merge_chunk_results, split_text_into_chunks
+from gliner2.processing.word_splitter import word_splitter_from
 from gliner2.inference.overlap import normalize_overlap_policy
 from gliner2.training.trainer import ExtractorCollator
 from gliner2.inference.candidate_decoder import finalize_spans
@@ -1228,7 +1229,12 @@ class ExtractorRuntimeMixin:
         doc_chunk_counts: List[int] = []
 
         for text, schema in zip(texts, schema_list):
-            chunks = split_text_into_chunks(text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+            chunks = split_text_into_chunks(
+                text,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                word_splitter=word_splitter_from(self),
+            )
             doc_chunks.append(chunks)
             doc_chunk_counts.append(len(chunks))
             for chunk in chunks:

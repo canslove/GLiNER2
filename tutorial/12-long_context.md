@@ -75,6 +75,19 @@ assert long_text[entity["start"]:entity["end"]] == entity["text"]
 
 Classification predictions are aggregated across chunks (higher confidence wins when scores exist). Span tasks are merged by position.
 
+By default, chunks are counted with the `"whitespace"` word splitter (the same strategy used to train public checkpoints). Long-document APIs use the splitter attached to the loaded model, so `word_splitter="char"` also changes chunk boundaries. That character-level splitter is suitable for languages without whitespace-delimited words, such as Chinese:
+
+```python
+model = AutoExtractor.from_pretrained(
+    "fastino/gliner2.5-multi-v1",
+    word_splitter="char",
+)
+# or after loading
+model.set_word_splitter("char")
+```
+
+Custom callables must yield `(token, start, end)` with exclusive-end offsets into the original text. Changing a pretrained model's word boundaries can affect quality unless training used the same splitter.
+
 ## Entity Extraction
 
 ```python

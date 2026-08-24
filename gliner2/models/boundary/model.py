@@ -1120,6 +1120,7 @@ class BoundaryExtractorModel(BaseExtractorModel):
         encoder_config=None,
         tokenizer=None,
         use_flashdeberta: Optional[bool] = None,
+        word_splitter=None,
     ):
         super().__init__(config)
         if config.architecture != "boundary":
@@ -1131,9 +1132,17 @@ class BoundaryExtractorModel(BaseExtractorModel):
 
         from gliner2.processor import SchemaTransformer
         if tokenizer is not None:
-            self.processor = SchemaTransformer(tokenizer=tokenizer, token_pooling=config.token_pooling)
+            self.processor = SchemaTransformer(
+                tokenizer=tokenizer,
+                token_pooling=config.token_pooling,
+                word_splitter=word_splitter,
+            )
         else:
-            self.processor = SchemaTransformer(config.model_name, token_pooling=config.token_pooling)
+            self.processor = SchemaTransformer(
+                config.model_name,
+                token_pooling=config.token_pooling,
+                word_splitter=word_splitter,
+            )
 
         self.encoder = self._load_encoder(
             config.model_name,
@@ -2073,6 +2082,7 @@ class BoundaryExtractorModel(BaseExtractorModel):
         compile_model = model_options.pop("compile", False)
         map_location = model_options.pop("map_location", None)
         use_flashdeberta = model_options.pop("use_flashdeberta", None)
+        word_splitter = model_options.pop("word_splitter", None)
 
         if config is None:
             config = cls.config_class.from_pretrained(
@@ -2094,6 +2104,7 @@ class BoundaryExtractorModel(BaseExtractorModel):
             encoder_config=encoder_config,
             tokenizer=tokenizer,
             use_flashdeberta=use_flashdeberta,
+            word_splitter=word_splitter,
         )
 
         state_dict = load_checkpoint_state_dict(repo_or_dir, hub_kwargs)

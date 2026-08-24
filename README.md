@@ -112,6 +112,39 @@ model.quantize()
 model.compile()
 ```
 
+### Custom word splitters
+
+GLiNER2 first splits text into **word tokens**, then encodes those tokens with the model's subword tokenizer. The default `"whitespace"` splitter is the one used to train public checkpoints.
+
+For languages without whitespace-delimited words, such as Chinese, use the character-level splitter:
+
+```python
+model = AutoExtractor.from_pretrained(
+    "fastino/gliner2.5-base-v1",
+    word_splitter="char",
+)
+
+# Or after loading
+model.set_word_splitter("char")
+```
+
+Built-in names:
+
+| Name | Class | Use when |
+|------|-------|----------|
+| `"whitespace"` (default) | `WhitespaceTokenSplitter` | Space-delimited languages; matches public checkpoints |
+| `"char"` | `CharLevelSplitter` | Languages such as Chinese; keeps Latin words/emails intact and splits other non-space characters |
+
+You can also pass a custom callable that yields `(token, start, end)` with exclusive-end offsets into the **original** text:
+
+```python
+from gliner2.processor import CharLevelSplitter
+
+model.set_word_splitter(CharLevelSplitter())
+```
+
+Changing a pretrained model's word boundaries can affect quality unless the model was trained with the same splitter. The choice is runtime-only: saved checkpoints reload with `"whitespace"` unless you pass `word_splitter` again.
+
 ### Architecture guide
 
 The boundary architecture (**GLiNER2.5**) uses sparse start/end pairing instead of a fixed span-width grid, so spans of any length that fit in the encoded window are representable. It supports entities, classification, structured record/event decoding, sparse relations, and span attributes when enabled by the checkpoint.

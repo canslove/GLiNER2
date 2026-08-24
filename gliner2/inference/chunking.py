@@ -7,22 +7,12 @@ merge duplicate predictions produced by overlapping chunks.
 
 from __future__ import annotations
 
-import re
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from gliner2.inference.overlap import normalize_overlap_policy, resolve_overlaps
-
-
-_WORD_PATTERN = re.compile(
-    r"""(?:https?://[^\s]+|www\.[^\s]+)
-    |[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}
-    |@[a-z0-9_]+
-    |\w+(?:[-_]\w+)*
-    |\S""",
-    re.VERBOSE | re.IGNORECASE,
-)
+from gliner2.processing.word_splitter import resolve_word_splitter
 
 
 @dataclass(frozen=True)
@@ -36,22 +26,25 @@ class TextChunk:
     end_word: int
 
 
-def iter_word_offsets(text: str) -> Iterable[Tuple[str, int, int]]:
-    """Yield regex word tokens and character offsets using processor-compatible rules.
+def iter_word_offsets(
+    text: str,
+    word_splitter=None,
+) -> Iterable[Tuple[str, int, int]]:
+    """Yield word tokens and character offsets using the active splitter.
 
-    The regex is matched against the original text (it is already case-insensitive)
-    so that the reported offsets index the caller's string. Lower-casing before
-    matching is unsafe because Unicode case folding can change string length
-    (e.g. ``"İ".lower()`` expands to two code points), which would shift offsets.
+    ``word_splitter`` may be a built-in name, a callable, or omitted to use
+    the default whitespace splitter. Offsets always index the original text;
+    chunking requests original-case token strings (``lower=False``).
     """
-    for match in _WORD_PATTERN.finditer(text):
-        yield match.group(), match.start(), match.end()
+    splitter = resolve_word_splitter(word_splitter)
+    yield from splitter(text, lower=False)
 
 
 def split_text_into_chunks(
     text: str,
     chunk_size: int = 384,
     chunk_overlap: int = 64,
+    word_splitter=None,
 ) -> List[TextChunk]:
     """Split text into overlapping word windows.
 
@@ -59,6 +52,7 @@ def split_text_into_chunks(
         text: Original document text.
         chunk_size: Maximum number of word tokens per chunk.
         chunk_overlap: Number of word tokens repeated between adjacent chunks.
+        word_splitter: Optional splitter name or callable used to count words.
     """
     if chunk_size <= 0:
         raise ValueError("chunk_size must be greater than 0")
@@ -67,7 +61,7 @@ def split_text_into_chunks(
     if chunk_overlap >= chunk_size:
         raise ValueError("chunk_overlap must be smaller than chunk_size")
 
-    tokens = list(iter_word_offsets(text))
+    tokens = list(iter_word_offsets(text, word_splitter=word_splitter))
     if not tokens:
         return [TextChunk(text=text, start_char=0, end_char=len(text), start_word=0, end_word=0)]
 
