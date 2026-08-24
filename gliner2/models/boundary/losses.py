@@ -42,8 +42,12 @@ def _reduce(
     query_mask: Optional[torch.BoolTensor],
     mode: str,
 ) -> torch.Tensor:
-    """Reduce a masked ``[B, Q, N]`` loss globally or per active query."""
+    """Reduce a masked ``[B, Q, N]`` loss globally, per query, or by sum."""
     keep_f = keep.to(elementwise.dtype)
+    if mode == "sum":
+        if query_mask is not None and keep_f.dim() >= 2:
+            keep_f = keep_f * query_mask.unsqueeze(-1).to(keep_f.dtype)
+        return (elementwise * keep_f).sum()
     if mode == "global":
         return (elementwise * keep_f).sum() / keep_f.sum().clamp_min(1)
     if mode != "per_query":
@@ -321,12 +325,13 @@ def marginal_pair_consistency_loss(
     b, q, n = start_logits.shape
 
     def accumulate(index: torch.LongTensor):
+        safe_index = index.clamp(0, n - 1)
         total = torch.zeros(
             b, q, n, dtype=log_survival.dtype, device=log_survival.device
         )
-        total.scatter_add_(2, index, log_survival)
+        total.scatter_add_(2, safe_index, log_survival)
         count = torch.zeros_like(total)
-        count.scatter_add_(2, index, valid_mask.to(total.dtype))
+        count.scatter_add_(2, safe_index, valid_mask.to(total.dtype))
         return 1.0 - torch.exp(total), count > 0
 
     predicted_start, reached_start = accumulate(indices[..., 0])

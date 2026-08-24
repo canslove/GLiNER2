@@ -504,15 +504,27 @@ class Structure:
         struct_name: str,
         _descriptions: Dict[str, str] = None,
         *,
-        mode: Optional[str] = None,
+        mode: Optional[str] = "natural",
         anchor: Optional[str] = None,
         occurrence_policy: Optional[str] = None,
+        _field_values: Optional[Dict[str, Any]] = None,
         **fields,
     ):
         self.struct_name = struct_name
-        self._fields = fields
+        # JSONL structure fields can legitimately be named ``mode``, ``anchor``,
+        # or ``occurrence_policy``. ``InputExample.from_dict`` uses this private
+        # mapping path so those names remain ordinary data fields rather than
+        # colliding with boundary record metadata arguments.
+        if _field_values is not None:
+            if fields:
+                raise ValueError("_field_values cannot be combined with field keywords")
+            self._fields = dict(_field_values)
+        else:
+            self._fields = fields
         self.descriptions = _descriptions
-        # Instance Formation metadata (optional; absence == legacy behavior).
+        # Basic pre-boundary JSON structures use natural record formation by
+        # default. When no anchor is provided, get_record_metadata selects the
+        # first declared structure field.
         self.mode = mode
         self.anchor = anchor
         self.occurrence_policy = occurrence_policy
@@ -557,11 +569,21 @@ class Structure:
                 errors.extend(value.validate(f"{self.struct_name}.{field_name}"))
             elif isinstance(value, list):
                 for i, v in enumerate(value):
-                    if v and v.lower() not in text.lower():
+                    if v is not None and not isinstance(v, str):
+                        errors.append(
+                            f"List value at index {i} in "
+                            f"'{self.struct_name}.{field_name}' must be a string"
+                        )
+                    elif v and v.lower() not in text.lower():
                         errors.append(f"List value '{v}' at index {i} in '{self.struct_name}.{field_name}' not found in text")
             elif isinstance(value, str):
                 if value and value.lower() not in text.lower():
                     errors.append(f"Value '{value}' for '{self.struct_name}.{field_name}' not found in text")
+            elif value is not None:
+                errors.append(
+                    f"Value for '{self.struct_name}.{field_name}' must be a string, "
+                    "list of strings, or ChoiceField"
+                )
         return errors
 
     def to_dict(self) -> Dict[str, Dict[str, Any]]:
@@ -959,10 +981,10 @@ class InputExample:
                 structures.append(Structure(
                     struct_name,
                     _descriptions=json_descriptions.get(struct_name),
-                    mode=meta.get("mode"),
+                    mode=meta.get("mode", "natural"),
                     anchor=meta.get("anchor"),
                     occurrence_policy=meta.get("occurrence_policy"),
-                    **parsed_fields,
+                    _field_values=parsed_fields,
                 ))
 
         relations = []
@@ -1222,7 +1244,13 @@ class TrainingDataset:
         print(f"Saved {len(self.examples)} examples to {path}")
 
     @classmethod
-    def load(cls, paths: Union[str, Path, List[Union[str, Path]]], shuffle: bool = False, seed: int = 42) -> 'TrainingDataset':
+    def load(
+        cls,
+        paths: Union[str, Path, List[Union[str, Path]]],
+        shuffle: bool = False,
+        seed: int = 42,
+        on_error: str = "raise",
+    ) -> 'TrainingDataset':
         """
         Load dataset from JSONL file(s).
 
@@ -1234,15 +1262,22 @@ class TrainingDataset:
             Whether to shuffle the loaded examples.
         seed : int, default=42
             Random seed for shuffling.
+        on_error : {"raise", "skip"}, default="raise"
+            Whether malformed or unparseable non-empty JSONL rows raise
+            immediately or are skipped. Skipped rows are recorded in the
+            returned dataset's ``skipped_lines`` attribute.
 
         Returns
         -------
         TrainingDataset
         """
+        if on_error not in {"raise", "skip"}:
+            raise ValueError("on_error must be 'raise' or 'skip'")
         if isinstance(paths, (str, Path)):
             paths = [paths]
 
         examples = []
+        skipped_lines: List[str] = []
         for path in paths:
             path = Path(path)
             with open(path, 'r', encoding='utf-8') as f:
@@ -1253,16 +1288,26 @@ class TrainingDataset:
                             data = json.loads(line)
                             examples.append(InputExample.from_dict(data))
                         except json.JSONDecodeError as e:
-                            raise ValueError(f"Invalid JSON in {path} line {line_num}: {e}")
+                            message = f"Invalid JSON in {path} line {line_num}: {e}"
+                            if on_error == "raise":
+                                raise ValueError(message)
+                            skipped_lines.append(message)
                         except Exception as e:
-                            raise ValueError(f"Error parsing {path} line {line_num}: {e}")
+                            message = f"Error parsing {path} line {line_num}: {e}"
+                            if on_error == "raise":
+                                raise ValueError(message)
+                            skipped_lines.append(message)
             print(f"Loaded {len(examples)} examples from {path}")
 
         if shuffle:
             random.seed(seed)
             random.shuffle(examples)
 
-        return cls(examples)
+        dataset = cls(examples)
+        dataset.skipped_lines = skipped_lines
+        if skipped_lines:
+            print(f"Skipped {len(skipped_lines)} malformed examples")
+        return dataset
 
     @classmethod
     def from_records(cls, records: List[Dict[str, Any]]) -> 'TrainingDataset':

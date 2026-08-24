@@ -489,8 +489,9 @@ The API mirrors the local interface exactly, making switching trivial:
 # Development: Use API for quick iteration
 extractor = GLiNER2.from_api()
 
-# Production: Switch to local if needed
-# extractor = GLiNER2.from_pretrained("your-model")
+# Production: switch to local GLiNER2.5 if needed
+# from gliner2 import AutoExtractor
+# extractor = AutoExtractor.from_pretrained("fastino/gliner2.5-base-v1")
 
 # Same code works with both!
 results = extractor.extract_entities(text, entity_types)

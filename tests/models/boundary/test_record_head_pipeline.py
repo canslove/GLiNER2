@@ -194,6 +194,166 @@ def test_engine_decode_records_emits_public_structure_shape():
     assert buyers == {"Alice", "Bob"}
 
 
+def test_engine_does_not_fall_back_to_legacy_for_empty_record_decode(
+    monkeypatch,
+):
+    model = _build_tiny_records_model()
+    seen = {}
+
+    def capture_records(*args, **kwargs):
+        seen["record_threshold"] = kwargs.get("threshold")
+        return {}
+
+    monkeypatch.setattr(model, "_decode_records", capture_records)
+
+    def capture_legacy(
+        batch,
+        sample_index,
+        core,
+        specs,
+        grouped_candidates,
+        metadata,
+        skip_names,
+        *args,
+    ):
+        seen["skip_names"] = skip_names
+        return {}
+
+    monkeypatch.setattr(model, "_decode_legacy_structures", capture_legacy)
+    schema = model.create_schema()
+    (
+        schema.structure("purchase", mode="natural", anchor="buyer")
+        .field("buyer", dtype="str")
+        .field("item", dtype="str")
+    )
+
+    model.extract("Alice bought apples", schema, threshold=0.17)
+
+    assert seen["skip_names"] == {"purchase"}
+    assert seen["record_threshold"] == 0.17
+
+
+def test_boundary_json_convenience_schema_enables_record_mode():
+    model = _build_tiny_records_model()
+
+    schema = model._json_schema({
+        "transaction": [
+            "merchant::str",
+            "amount::str",
+            "tags::list",
+        ],
+    })
+    built = schema.build()
+
+    assert built["record_metadata"]["transaction"] == {
+        "mode": "natural",
+        "anchor": "merchant",
+        "fields": {
+            "merchant": {
+                "cardinality": "required_one",
+                "exclusive": True,
+            },
+            "amount": {
+                "cardinality": "required_one",
+                "exclusive": True,
+            },
+            "tags": {
+                "cardinality": "zero_or_more",
+                "exclusive": True,
+            },
+        },
+    }
+
+
+def test_choice_decoder_honors_record_local_preference(monkeypatch):
+    from types import SimpleNamespace
+
+    model = _build_tiny_records_model()
+    hidden = model.hidden_size
+    monkeypatch.setattr(
+        model.boundary_head,
+        "score_explicit_spans",
+        lambda *args, **kwargs: torch.tensor([[[0.0, 2.0]]]),
+    )
+    batch = SimpleNamespace(text_tokens=[["food", "transport"]])
+    core = {
+        "text_states": torch.randn(1, 2, hidden),
+        "text_mask": torch.ones(1, 2, dtype=torch.bool),
+        "query_states": torch.randn(1, 1, hidden),
+        "query_mask": torch.ones(1, 1, dtype=torch.bool),
+    }
+
+    value = model._decode_choice_field(
+        batch,
+        sample_index=0,
+        core=core,
+        query_id=0,
+        choices=["food", "transport"],
+        dtype="str",
+        configured_threshold=None,
+        default_threshold=0.5,
+        prefix_length=2,
+        include_confidence=True,
+        preferred_choices=[("transport", 10, 19)],
+        include_spans=True,
+    )
+
+    assert value["text"] == "transport"
+    assert value["start"] == 10
+    assert value["end"] == 19
+    assert value["confidence"] > 0.5
+
+
+def test_literal_choices_bind_to_preceding_record_anchor():
+    from gliner2.inference.engine import BoundaryExtractor
+
+    text = (
+        "Amazon charged $12 for books. "
+        "Amazon charged $8 for music."
+    )
+    has_mentions, assigned = (
+        BoundaryExtractor._record_local_choice_mentions(
+            text,
+            ["books", "music", "food"],
+            [(0, 6), (30, 36)],
+        )
+    )
+
+    assert has_mentions is True
+    assert assigned == {
+        0: [("books", 23, 28)],
+        1: [("music", 52, 57)],
+    }
+
+
+def test_literal_choices_stay_with_preceding_anchor_across_clauses():
+    from gliner2.inference.engine import BoundaryExtractor
+
+    text = (
+        "Hilton was booked. The room includes breakfast and parking. "
+        "Grand Hotel was booked. Amenities include breakfast, wifi, and spa."
+    )
+    second_anchor = text.index("Grand Hotel")
+    has_mentions, assigned = (
+        BoundaryExtractor._record_local_choice_mentions(
+            text,
+            ["breakfast", "parking", "wifi", "spa"],
+            [(0, len("Hilton")), (second_anchor, second_anchor + 11)],
+        )
+    )
+
+    assert has_mentions is True
+    assert [choice for choice, _, _ in assigned[0]] == [
+        "breakfast",
+        "parking",
+    ]
+    assert [choice for choice, _, _ in assigned[1]] == [
+        "breakfast",
+        "wifi",
+        "spa",
+    ]
+
+
 def make_candidates(
     fields: List[List[Tuple[int, int]]],
     hidden: int,
@@ -222,6 +382,33 @@ def make_candidates(
         query_mask=torch.ones(1, q, dtype=torch.bool),
         candidate_states=states,
     )
+
+
+def test_record_head_masks_out_of_range_field_query_ids():
+    hidden = 24
+    candidates = make_candidates([[(0, 1), (2, 3)]], hidden)
+    spec = RecordSpec(
+        task_index=0,
+        task_name="event",
+        task_type="json_structures",
+        mode="natural",
+        fields=(
+            RecordFieldSpec(
+                7, "anchor", 0, FieldCardinality.REQUIRED_ONE, is_anchor=True
+            ),
+        ),
+        anchor_query_id=7,
+    )
+    head = RecordHead(hidden, record_dim=hidden, instance_queries=4)
+    group = head.forward_group_dense(
+        spec,
+        torch.randn(1, hidden),
+        candidates,
+        sample_index=0,
+    )
+    assert not group.instance_mask.any()
+    assert not group.field_membership.any()
+    assert torch.isfinite(group.assign_logits).all()
 
 
 def test_natural_mode_overfits_two_records_and_derives_count():
@@ -436,3 +623,90 @@ def test_decode_respects_exclusive_candidate():
     decoded = decode_group(group, anchor_threshold=0.5, field_threshold=0.2)
     holders = [rec for rec in decoded if rec.fields.get(1)]
     assert len(holders) == 1  # exclusivity honored across instances
+
+
+def test_decode_jointly_assigns_exclusive_scalar_fields():
+    torch.manual_seed(4)
+    hidden = 16
+    cands = make_candidates(
+        [[(0, 1), (3, 4)], [(1, 2), (4, 5)]],
+        hidden,
+        high_logit_field=0,
+    )
+    spec = RecordSpec(
+        task_index=0,
+        task_name="purchase",
+        task_type="json_structures",
+        mode="natural",
+        fields=(
+            RecordFieldSpec(
+                0,
+                "buyer",
+                0,
+                FieldCardinality.REQUIRED_ONE,
+                is_anchor=True,
+            ),
+            RecordFieldSpec(
+                1,
+                "item",
+                1,
+                FieldCardinality.REQUIRED_ONE,
+                exclusive=True,
+            ),
+        ),
+        anchor_query_id=0,
+    )
+    head = RecordHead(hidden, record_dim=16, instance_queries=8)
+    with torch.no_grad():
+        group = head.forward_group(spec, torch.randn(2, hidden), cands, 0)
+        # Greedy decoding gives anchor 0 candidate 0 and forces anchor 1 onto
+        # candidate 1. The globally optimal one-to-one assignment is reversed.
+        group.assign_logits[1][:] = torch.tensor([
+            [-10.0, 5.0, 4.0],
+            [-10.0, 4.9, -5.0],
+        ])
+
+    decoded = decode_group(group, anchor_threshold=0.5, field_threshold=0.2)
+    by_anchor = {record.anchor_span: record.fields[1] for record in decoded}
+    assert by_anchor[(0, 1)] == [(4, 5)]
+    assert by_anchor[(3, 4)] == [(1, 2)]
+
+
+def test_decode_required_scalar_does_not_select_absent():
+    torch.manual_seed(5)
+    hidden = 16
+    cands = make_candidates(
+        [[(0, 1)], [(1, 2)]],
+        hidden,
+        high_logit_field=0,
+    )
+    spec = RecordSpec(
+        task_index=0,
+        task_name="purchase",
+        task_type="json_structures",
+        mode="natural",
+        fields=(
+            RecordFieldSpec(
+                0,
+                "buyer",
+                0,
+                FieldCardinality.REQUIRED_ONE,
+                is_anchor=True,
+            ),
+            RecordFieldSpec(
+                1,
+                "item",
+                1,
+                FieldCardinality.REQUIRED_ONE,
+            ),
+        ),
+        anchor_query_id=0,
+    )
+    head = RecordHead(hidden, record_dim=16, instance_queries=8)
+    with torch.no_grad():
+        group = head.forward_group(spec, torch.randn(2, hidden), cands, 0)
+        group.assign_logits[1][:] = torch.tensor([[5.0, 4.0]])
+
+    decoded = decode_group(group, anchor_threshold=0.5, field_threshold=0.2)
+    assert decoded[0].fields[1] == [(1, 2)]
+    assert decoded[0].field_scores[1][0] > 0

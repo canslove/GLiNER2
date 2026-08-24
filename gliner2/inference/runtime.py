@@ -25,11 +25,13 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-from gliner2.inference.schema import (
+from gliner2.inference.schema import (  # noqa: F401 - compatibility exports
     AttributeGroup, RegexValidator, StructureBuilder, Schema
-)  # noqa: F401
+)
 from gliner2.processor import PreprocessedBatch
 from gliner2.inference.chunking import merge_chunk_results, split_text_into_chunks
+from gliner2.processing.word_splitter import word_splitter_from
+from gliner2.inference.overlap import normalize_overlap_policy
 from gliner2.training.trainer import ExtractorCollator
 from gliner2.inference.candidate_decoder import finalize_spans
 
@@ -81,6 +83,8 @@ class ExtractorRuntimeMixin:
         """Extract from multiple texts with parallel preprocessing."""
         if not texts:
             return []
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than 0")
 
         self.eval()
         self.processor.change_mode(is_training=False)
@@ -94,6 +98,7 @@ class ExtractorRuntimeMixin:
 
         schema_dicts, metadata_list = self._build_schema_dicts_and_metadata(schema_list)
         if overlap_policy is not None:
+            overlap_policy = normalize_overlap_policy(overlap_policy)
             for metadata in metadata_list:
                 metadata["_overlap_policy"] = overlap_policy
 
@@ -161,6 +166,10 @@ class ExtractorRuntimeMixin:
                     "field_metadata": schema._field_metadata,
                     "entity_metadata": schema._entity_metadata,
                     "relation_metadata": getattr(schema, '_relation_metadata', {}),
+                    "relation_descriptions": schema_dict.get(
+                        "relation_descriptions",
+                        {},
+                    ),
                     "field_orders": schema._field_orders,
                     "entity_order": schema._entity_order,
                     "relation_order": getattr(schema, '_relation_order', []),
@@ -184,7 +193,12 @@ class ExtractorRuntimeMixin:
                 entity_order = list(schema_dict["entities"].keys()) if isinstance(schema_dict.get("entities"), dict) else []
                 metadata = {
                     "field_metadata": {}, "entity_metadata": {},
-                    "relation_metadata": {}, "field_orders": {},
+                    "relation_metadata": {},
+                    "relation_descriptions": schema_dict.get(
+                        "relation_descriptions",
+                        {},
+                    ),
+                    "field_orders": {},
                     "entity_order": entity_order, "relation_order": [],
                     "classification_tasks": classification_tasks,
                     "entity_attribute_groups": {},
@@ -206,6 +220,27 @@ class ExtractorRuntimeMixin:
             metadata_list.append(metadata)
 
         return schema_dicts, metadata_list
+
+    def _resolved_overlap_policy(
+        self,
+        overlap_policy: Optional[str] = None,
+    ) -> Optional[str]:
+        """Resolve an explicit policy while preserving architecture defaults."""
+        if overlap_policy is not None:
+            return normalize_overlap_policy(overlap_policy)
+        if getattr(self, "architecture", "span") != "boundary":
+            # ``None`` selects the historical confidence-first greedy decoder
+            # for span checkpoints. Explicit ``flat``/``disallow`` uses the
+            # shared architecture-neutral resolver.
+            return None
+        settings = getattr(self, "boundary_settings", None)
+        default = getattr(settings, "overlap_policy", "disallow")
+        return normalize_overlap_policy(None, default=default)
+
+    def _metadata_overlap_policy(
+        self, metadata: Dict[str, Any]
+    ) -> Optional[str]:
+        return self._resolved_overlap_policy(metadata.get("_overlap_policy"))
 
     def _extract_from_batch(
         self,
@@ -487,15 +522,23 @@ class ExtractorRuntimeMixin:
             meta = metadata.get("entity_metadata", {}).get(name, {})
             meta_threshold = meta.get("threshold")
             dtype = meta.get("dtype", "list")
+            validators = meta.get("validators", [])
 
             entity_scores = scores[idx]
             ent_threshold = float(meta_threshold) if meta_threshold is not None else threshold
 
+            spans = self._find_spans(
+                entity_scores, ent_threshold, text_len, text, start_map, end_map
+            )
+            if validators:
+                spans = [
+                    span for span in spans
+                    if all(validator.validate(span[0]) for validator in validators)
+                ]
             spans = finalize_spans(
-                self._find_spans(
-                    entity_scores, ent_threshold, text_len, text, start_map, end_map
-                ),
+                spans,
                 dtype=dtype,
+                overlap_policy=self._metadata_overlap_policy(metadata),
             )
 
             if dtype == "list":
@@ -561,6 +604,7 @@ class ExtractorRuntimeMixin:
             index = entity_names.index(name)
             meta = metadata.get("entity_metadata", {}).get(name, {})
             configured_threshold = meta.get("threshold")
+            validators = meta.get("validators", [])
 
             entity_scores = scores[index]
             entity_threshold = (
@@ -580,7 +624,13 @@ class ExtractorRuntimeMixin:
                     span_text = text[char_start:char_end].strip()
                 except (IndexError, KeyError):
                     continue
-                if not span_text:
+                if not span_text or (
+                    validators
+                    and not all(
+                        validator.validate(span_text)
+                        for validator in validators
+                    )
+                ):
                     continue
                 found.append(
                     {
@@ -594,18 +644,29 @@ class ExtractorRuntimeMixin:
                     }
                 )
 
-            surviving = {
-                (start, end, score)
-                for _, score, start, end in finalize_spans(
-                    [(item["text"], item["confidence"], item["start"], item["end"])
-                     for item in found],
-                    dtype=meta.get("dtype", "list"),
-                )
+            surviving = finalize_spans(
+                [
+                    (
+                        item["text"],
+                        item["confidence"],
+                        item["start"],
+                        item["end"],
+                    )
+                    for item in found
+                ],
+                dtype=meta.get("dtype", "list"),
+                overlap_policy=self._metadata_overlap_policy(metadata),
+            )
+            found_by_span = {
+                (item["start"], item["end"]): item for item in found
             }
             formatted = [
-                self._format_attributed_entity(item, include_confidence, include_spans)
-                for item in found
-                if (item["start"], item["end"], item["confidence"]) in surviving
+                self._format_attributed_entity(
+                    found_by_span[(start, end)],
+                    include_confidence,
+                    include_spans,
+                )
+                for _, _, start, end in surviving
             ]
             entity_results[name] = formatted if meta.get("dtype", "list") == "list" else (formatted[0] if formatted else None)
 
@@ -712,6 +773,10 @@ class ExtractorRuntimeMixin:
                 spans = self._find_spans(
                     scores[fidx], rel_threshold, text_len, text,
                     start_map, end_map
+                )
+                spans = finalize_spans(
+                    spans,
+                    overlap_policy=self._metadata_overlap_policy(metadata),
                 )
 
                 if spans:
@@ -830,9 +895,19 @@ class ExtractorRuntimeMixin:
 
                     if validators:
                         spans = [s for s in spans if all(v.validate(s[0]) for v in validators)]
+                    spans = finalize_spans(
+                        spans,
+                        dtype=dtype,
+                        overlap_policy=self._metadata_overlap_policy(metadata),
+                    )
 
                     if dtype == "list":
-                        instance[fname] = self._format_spans(spans, include_confidence, include_spans)
+                        instance[fname] = self._format_spans(
+                            spans,
+                            include_confidence,
+                            include_spans,
+                            already_finalized=True,
+                        )
                     else:
                         if spans:
                             text_val, conf, char_start, char_end = spans[0]
@@ -898,6 +973,7 @@ class ExtractorRuntimeMixin:
         include_confidence: bool,
         include_spans: bool = False,
         already_finalized: bool = False,
+        overlap_policy: Optional[str] = None,
     ) -> Union[List[str], List[Dict], List[Tuple]]:
         """Format entity spans after canonical overlap decoding."""
         if not spans:
@@ -905,7 +981,10 @@ class ExtractorRuntimeMixin:
         if already_finalized:
             selected = spans
         else:
-            selected = finalize_spans(spans)
+            selected = finalize_spans(
+                spans,
+                overlap_policy=self._resolved_overlap_policy(overlap_policy),
+            )
 
         if include_spans and include_confidence:
             return [{"text": s[0], "confidence": s[1], "start": s[2], "end": s[3]} for s in selected]
@@ -1150,7 +1229,12 @@ class ExtractorRuntimeMixin:
         doc_chunk_counts: List[int] = []
 
         for text, schema in zip(texts, schema_list):
-            chunks = split_text_into_chunks(text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+            chunks = split_text_into_chunks(
+                text,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                word_splitter=word_splitter_from(self),
+            )
             doc_chunks.append(chunks)
             doc_chunk_counts.append(len(chunks))
             for chunk in chunks:
@@ -1182,6 +1266,7 @@ class ExtractorRuntimeMixin:
                     include_confidence=include_confidence,
                     include_spans=include_spans,
                     scalar_entity_labels=self._scalar_entity_labels(schema),
+                    overlap_policy=self._resolved_overlap_policy(overlap_policy),
                 )
             )
             offset += count
@@ -1202,12 +1287,13 @@ class ExtractorRuntimeMixin:
 
     def extract_entities(self, text: str, entity_types, threshold: float = 0.5,
                         format_results: bool = True, include_confidence: bool = False,
-                        include_spans: bool = False, max_len: Optional[int] = None) -> Dict:
+                        include_spans: bool = False, max_len: Optional[int] = None,
+                        overlap_policy: Optional[str] = None) -> Dict:
         """Extract entities from text."""
         schema = self.create_schema().entities(entity_types)
         return self.extract(
             text, schema, threshold, format_results, include_confidence,
-            include_spans, max_len=max_len,
+            include_spans, max_len=max_len, overlap_policy=overlap_policy,
         )
 
     def extract_entities_long(
@@ -1222,6 +1308,7 @@ class ExtractorRuntimeMixin:
         format_results: bool = True,
         include_confidence: bool = False,
         include_spans: bool = False,
+        overlap_policy: Optional[str] = None,
     ) -> Dict:
         """Extract entities from a long document with overlapping word chunks."""
         schema = self.create_schema().entities(entity_types)
@@ -1242,12 +1329,14 @@ class ExtractorRuntimeMixin:
     def batch_extract_entities(self, texts: List[str], entity_types, batch_size: int = 8,
                                threshold: float = 0.5, format_results: bool = True,
                                include_confidence: bool = False, include_spans: bool = False,
-                               max_len: Optional[int] = None) -> List[Dict]:
+                               max_len: Optional[int] = None,
+                               overlap_policy: Optional[str] = None) -> List[Dict]:
         """Batch extract entities."""
         schema = self.create_schema().entities(entity_types)
         return self.batch_extract(
             texts, schema, batch_size, threshold, 0, format_results,
             include_confidence, include_spans, max_len=max_len,
+            overlap_policy=overlap_policy,
         )
 
     def batch_extract_entities_long(
@@ -1262,6 +1351,7 @@ class ExtractorRuntimeMixin:
         include_spans: bool = False,
         chunk_size: int = 384,
         chunk_overlap: int = 64,
+        overlap_policy: Optional[str] = None,
     ) -> List[Dict]:
         """Batch extract entities from long documents with overlapping word chunks."""
         schema = self.create_schema().entities(entity_types)
@@ -1276,27 +1366,92 @@ class ExtractorRuntimeMixin:
             include_spans=include_spans,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
+            overlap_policy=overlap_policy,
         )
 
     def classify_text(self, text: str, tasks: Dict, threshold: float = 0.5,
                      format_results: bool = True, include_confidence: bool = False,
-                     include_spans: bool = False, max_len: Optional[int] = None) -> Dict:
+                     include_spans: bool = False, max_len: Optional[int] = None,
+                     overlap_policy: Optional[str] = None) -> Dict:
         """Classify text."""
-        schema = self.create_schema()
-        for name, config in tasks.items():
-            if isinstance(config, dict) and "labels" in config:
-                cfg = config.copy()
-                labels = cfg.pop("labels")
-                schema.classification(name, labels, **cfg)
-            else:
-                schema.classification(name, config)
-        return self.extract(text, schema, threshold, format_results, include_confidence, include_spans, max_len=max_len)
+        schema = self._classification_schema(tasks)
+        return self.extract(
+            text, schema, threshold, format_results, include_confidence,
+            include_spans, max_len=max_len, overlap_policy=overlap_policy,
+        )
 
     def batch_classify_text(self, texts: List[str], tasks: Dict, batch_size: int = 8,
                            threshold: float = 0.5, format_results: bool = True,
                            include_confidence: bool = False, include_spans: bool = False,
-                           max_len: Optional[int] = None) -> List[Dict]:
+                           max_len: Optional[int] = None,
+                           overlap_policy: Optional[str] = None) -> List[Dict]:
         """Batch classify texts."""
+        schema = self._classification_schema(tasks)
+        return self.batch_extract(
+            texts, schema, batch_size, threshold, 0, format_results,
+            include_confidence, include_spans, max_len=max_len,
+            overlap_policy=overlap_policy,
+        )
+
+    def classify_text_long(
+        self,
+        text: str,
+        tasks: Dict,
+        threshold: float = 0.5,
+        chunk_size: int = 384,
+        chunk_overlap: int = 64,
+        batch_size: int = 8,
+        num_workers: int = 0,
+        format_results: bool = True,
+        include_confidence: bool = False,
+        include_spans: bool = False,
+        overlap_policy: Optional[str] = None,
+    ) -> Dict:
+        """Classify a long document and merge chunk-level decisions."""
+        return self.extract_long(
+            text,
+            self._classification_schema(tasks),
+            threshold=threshold,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            format_results=format_results,
+            include_confidence=include_confidence,
+            include_spans=include_spans,
+            overlap_policy=overlap_policy,
+        )
+
+    def batch_classify_text_long(
+        self,
+        texts: List[str],
+        tasks: Dict,
+        batch_size: int = 8,
+        threshold: float = 0.5,
+        num_workers: int = 0,
+        format_results: bool = True,
+        include_confidence: bool = False,
+        include_spans: bool = False,
+        chunk_size: int = 384,
+        chunk_overlap: int = 64,
+        overlap_policy: Optional[str] = None,
+    ) -> List[Dict]:
+        """Classify long documents and merge each document independently."""
+        return self.batch_extract_long(
+            texts,
+            self._classification_schema(tasks),
+            batch_size=batch_size,
+            threshold=threshold,
+            num_workers=num_workers,
+            format_results=format_results,
+            include_confidence=include_confidence,
+            include_spans=include_spans,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            overlap_policy=overlap_policy,
+        )
+
+    def _classification_schema(self, tasks: Dict) -> Schema:
         schema = self.create_schema()
         for name, config in tasks.items():
             if isinstance(config, dict) and "labels" in config:
@@ -1305,47 +1460,205 @@ class ExtractorRuntimeMixin:
                 schema.classification(name, labels, **cfg)
             else:
                 schema.classification(name, config)
-        return self.batch_extract(texts, schema, batch_size, threshold, 0, format_results, include_confidence, include_spans, max_len=max_len)
+        return schema
 
     def extract_json(self, text: str, structures: Dict, threshold: float = 0.5,
                     format_results: bool = True, include_confidence: bool = False,
-                    include_spans: bool = False, max_len: Optional[int] = None) -> Dict:
+                    include_spans: bool = False, max_len: Optional[int] = None,
+                    overlap_policy: Optional[str] = None) -> Dict:
         """Extract structured data."""
-        schema = self.create_schema()
-        for parent, fields in structures.items():
-            builder = schema.structure(parent)
-            for spec in fields:
-                name, dtype, choices, desc = self._parse_field_spec(spec)
-                builder.field(name, dtype=dtype, choices=choices, description=desc)
-        return self.extract(text, schema, threshold, format_results, include_confidence, include_spans, max_len=max_len)
+        return self.extract(
+            text, self._json_schema(structures), threshold, format_results,
+            include_confidence, include_spans, max_len=max_len,
+            overlap_policy=overlap_policy,
+        )
 
     def batch_extract_json(self, texts: List[str], structures: Dict, batch_size: int = 8,
                           threshold: float = 0.5, format_results: bool = True,
                           include_confidence: bool = False, include_spans: bool = False,
-                          max_len: Optional[int] = None) -> List[Dict]:
+                          max_len: Optional[int] = None,
+                          overlap_policy: Optional[str] = None) -> List[Dict]:
         """Batch extract structured data."""
+        return self.batch_extract(
+            texts, self._json_schema(structures), batch_size, threshold, 0,
+            format_results, include_confidence, include_spans, max_len=max_len,
+            overlap_policy=overlap_policy,
+        )
+
+    def extract_json_long(
+        self,
+        text: str,
+        structures: Dict,
+        threshold: float = 0.5,
+        chunk_size: int = 384,
+        chunk_overlap: int = 64,
+        batch_size: int = 8,
+        num_workers: int = 0,
+        format_results: bool = True,
+        include_confidence: bool = False,
+        include_spans: bool = False,
+        overlap_policy: Optional[str] = None,
+    ) -> Dict:
+        """Extract structured data from a long document."""
+        return self.extract_long(
+            text,
+            self._json_schema(structures),
+            threshold=threshold,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            format_results=format_results,
+            include_confidence=include_confidence,
+            include_spans=include_spans,
+            overlap_policy=overlap_policy,
+        )
+
+    def batch_extract_json_long(
+        self,
+        texts: List[str],
+        structures: Dict,
+        batch_size: int = 8,
+        threshold: float = 0.5,
+        num_workers: int = 0,
+        format_results: bool = True,
+        include_confidence: bool = False,
+        include_spans: bool = False,
+        chunk_size: int = 384,
+        chunk_overlap: int = 64,
+        overlap_policy: Optional[str] = None,
+    ) -> List[Dict]:
+        """Batch extract structured data from long documents."""
+        return self.batch_extract_long(
+            texts,
+            self._json_schema(structures),
+            batch_size=batch_size,
+            threshold=threshold,
+            num_workers=num_workers,
+            format_results=format_results,
+            include_confidence=include_confidence,
+            include_spans=include_spans,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            overlap_policy=overlap_policy,
+        )
+
+    def _json_schema(self, structures: Dict) -> Schema:
         schema = self.create_schema()
+        record_mode = (
+            "natural"
+            if getattr(self, "enable_records", False)
+            else None
+        )
         for parent, fields in structures.items():
-            builder = schema.structure(parent)
+            # Boundary checkpoints with an Instance Formation head should use
+            # it for the public JSON convenience API. The first declared field
+            # becomes the natural anchor, matching the documented schema order.
+            # Explicit ``Schema.structure(..., mode=None)`` remains available
+            # when callers intentionally want the legacy aggregate decoder.
+            builder = schema.structure(
+                parent,
+                mode=record_mode,
+            )
             for spec in fields:
                 name, dtype, choices, desc = self._parse_field_spec(spec)
-                builder.field(name, dtype=dtype, choices=choices, description=desc)
-        return self.batch_extract(texts, schema, batch_size, threshold, 0, format_results, include_confidence, include_spans, max_len=max_len)
+                builder.field(
+                    name,
+                    dtype=dtype,
+                    choices=choices,
+                    description=desc,
+                    cardinality=(
+                        "required_one"
+                        if record_mode and dtype == "str"
+                        else "zero_or_more"
+                        if record_mode
+                        else None
+                    ),
+                    exclusive=record_mode is not None,
+                )
+        return schema
 
     def extract_relations(self, text: str, relation_types, threshold: float = 0.5,
                          format_results: bool = True, include_confidence: bool = False,
-                         include_spans: bool = False, max_len: Optional[int] = None) -> Dict:
+                         include_spans: bool = False, max_len: Optional[int] = None,
+                         overlap_policy: Optional[str] = None) -> Dict:
         """Extract relations."""
         schema = self.create_schema().relations(relation_types)
-        return self.extract(text, schema, threshold, format_results, include_confidence, include_spans, max_len=max_len)
+        return self.extract(
+            text, schema, threshold, format_results, include_confidence,
+            include_spans, max_len=max_len, overlap_policy=overlap_policy,
+        )
 
     def batch_extract_relations(self, texts: List[str], relation_types, batch_size: int = 8,
                                threshold: float = 0.5, format_results: bool = True,
                                include_confidence: bool = False, include_spans: bool = False,
-                               max_len: Optional[int] = None) -> List[Dict]:
+                               max_len: Optional[int] = None,
+                               overlap_policy: Optional[str] = None) -> List[Dict]:
         """Batch extract relations."""
         schema = self.create_schema().relations(relation_types)
-        return self.batch_extract(texts, schema, batch_size, threshold, 0, format_results, include_confidence, include_spans, max_len=max_len)
+        return self.batch_extract(
+            texts, schema, batch_size, threshold, 0, format_results,
+            include_confidence, include_spans, max_len=max_len,
+            overlap_policy=overlap_policy,
+        )
+
+    def extract_relations_long(
+        self,
+        text: str,
+        relation_types,
+        threshold: float = 0.5,
+        chunk_size: int = 384,
+        chunk_overlap: int = 64,
+        batch_size: int = 8,
+        num_workers: int = 0,
+        format_results: bool = True,
+        include_confidence: bool = False,
+        include_spans: bool = False,
+        overlap_policy: Optional[str] = None,
+    ) -> Dict:
+        """Extract relations from a long document."""
+        return self.extract_long(
+            text,
+            self.create_schema().relations(relation_types),
+            threshold=threshold,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            format_results=format_results,
+            include_confidence=include_confidence,
+            include_spans=include_spans,
+            overlap_policy=overlap_policy,
+        )
+
+    def batch_extract_relations_long(
+        self,
+        texts: List[str],
+        relation_types,
+        batch_size: int = 8,
+        threshold: float = 0.5,
+        num_workers: int = 0,
+        format_results: bool = True,
+        include_confidence: bool = False,
+        include_spans: bool = False,
+        chunk_size: int = 384,
+        chunk_overlap: int = 64,
+        overlap_policy: Optional[str] = None,
+    ) -> List[Dict]:
+        """Batch extract relations from long documents."""
+        return self.batch_extract_long(
+            texts,
+            self.create_schema().relations(relation_types),
+            batch_size=batch_size,
+            threshold=threshold,
+            num_workers=num_workers,
+            format_results=format_results,
+            include_confidence=include_confidence,
+            include_spans=include_spans,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            overlap_policy=overlap_policy,
+        )
 
     def _parse_field_spec(self, spec: Union[str, Dict]) -> Tuple[str, str, Optional[List[str]], Optional[str]]:
         """Parse field specification string or dictionary."""

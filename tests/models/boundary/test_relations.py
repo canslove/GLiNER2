@@ -167,13 +167,22 @@ def test_boundary_model_wires_sparse_relation_loss():
         0,
         {
             "rel_specs": [[{
-                "spec": RelationTypeSpec("works_for", (0,), (1,)),
+                "spec": RelationTypeSpec(
+                    "works_for: a person is employed by an organization",
+                    (0,),
+                    (1,),
+                ),
                 "query_state": torch.zeros(model.hidden_size),
             }]],
             "text_states": torch.zeros(1, 4, model.hidden_size),
         },
         candidates,
-        {"relation_metadata": {}},
+        {
+            "relation_metadata": {},
+            "relation_descriptions": {
+                "works_for": "a person is employed by an organization",
+            },
+        },
         threshold=0.5,
         offset=0,
         start_map=[0, 6, 12, 16],
@@ -187,3 +196,66 @@ def test_boundary_model_wires_sparse_relation_loss():
         "head": {"text": "Alice", "start": 0, "end": 5},
         "tail": {"text": "Acme", "start": 16, "end": 20},
     }]
+
+
+def test_relation_decoder_collapses_partial_and_repeated_mentions():
+    from gliner2.inference.engine import BoundaryExtractor
+
+    edges = [
+        {
+            "score": 0.99,
+            "head": ("Anika Rao", 0, 9),
+            "tail": ("Helio", 20, 25),
+        },
+        {
+            "score": 0.98,
+            "head": ("Anika Rao", 0, 9),
+            "tail": ("Helio Robotics", 20, 34),
+        },
+        {
+            "score": 0.995,
+            "head": ("Anika Rao", 0, 9),
+            "tail": ("Helio Robotics", 80, 94),
+        },
+    ]
+
+    decoded = BoundaryExtractor._deduplicate_relation_edges(edges)
+
+    assert len(decoded) == 1
+    assert decoded[0]["head"] == ("Anika Rao", 0, 9)
+    # The containing mention is canonical, and the closest occurrence wins
+    # over a marginally higher-scoring distant cross-product.
+    assert decoded[0]["tail"] == ("Helio Robotics", 20, 34)
+
+
+def test_relation_description_survives_schema_roundtrip():
+    from gliner2.inference.engine import BoundaryExtractor
+    from gliner2.inference.schema import Schema
+
+    schema = Schema()
+    schema.relations({
+        "acquired": {
+            "description": "completed purchase of a company",
+            "threshold": 0.75,
+        },
+    })
+
+    built = schema.build()
+    assert built["relation_descriptions"] == {
+        "acquired": "completed purchase of a company",
+    }
+    serialized = schema.to_dict()
+    assert serialized["relations"]["acquired"] == {
+        "description": "completed purchase of a company",
+        "threshold": 0.75,
+    }
+    assert Schema.from_dict(serialized).build()["relation_descriptions"] == (
+        built["relation_descriptions"]
+    )
+    _, metadata = BoundaryExtractor._build_schema_dicts_and_metadata(
+        object(),
+        [schema],
+    )
+    assert metadata[0]["relation_descriptions"] == built[
+        "relation_descriptions"
+    ]

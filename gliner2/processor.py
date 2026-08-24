@@ -8,12 +8,18 @@ via DataLoader collate functions for parallel preprocessing.
 import copy
 import logging
 import random
-import re
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Dict, Tuple, Iterator, List, Optional
+from typing import Any, Dict, Tuple, List, Optional
 import torch
 from transformers import AutoTokenizer
+
+from gliner2.processing.word_splitter import (  # noqa: F401 - public re-exports
+    CharLevelSplitter,
+    WhitespaceTokenSplitter,
+    WordSplitterSpec,
+    resolve_word_splitter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,17 +89,17 @@ class PreprocessedBatch:
     def to(self, device: torch.device, dtype: torch.dtype = None) -> 'PreprocessedBatch':
         """Move tensors to device and optionally cast float tensors to dtype.
 
-        Integer tensors (input_ids, text_word_indices) are moved to the device
-        but keep their original dtype regardless of the *dtype* argument.
+        Integer and boolean tensors are moved to the device but keep their
+        original dtype regardless of the *dtype* argument.
         """
-        def _cast(t, is_int=False):
+        def _cast(t):
             t = t.to(device)
-            if dtype is not None and not is_int:
+            if dtype is not None and (t.is_floating_point() or t.is_complex()):
                 t = t.to(dtype)
             return t
 
         return PreprocessedBatch(
-            input_ids=_cast(self.input_ids, is_int=True),
+            input_ids=_cast(self.input_ids),
             attention_mask=_cast(self.attention_mask),
             mapped_indices=self.mapped_indices,
             schema_counts=self.schema_counts,
@@ -107,37 +113,37 @@ class PreprocessedBatch:
             original_texts=self.original_texts,
             original_schemas=self.original_schemas,
             text_word_indices=(
-                _cast(self.text_word_indices, is_int=True)
+                _cast(self.text_word_indices)
                 if self.text_word_indices is not None else None
             ),
             text_word_mask=(
-                _cast(self.text_word_mask, is_int=True)
+                _cast(self.text_word_mask)
                 if self.text_word_mask is not None else None
             ),
             text_word_counts=self.text_word_counts,
             schema_special_indices=self.schema_special_indices,
             query_marker_indices=(
-                _cast(self.query_marker_indices, is_int=True)
+                _cast(self.query_marker_indices)
                 if self.query_marker_indices is not None else None
             ),
             query_marker_mask=(
-                _cast(self.query_marker_mask, is_int=True)
+                _cast(self.query_marker_mask)
                 if self.query_marker_mask is not None else None
             ),
             query_group_index=(
-                _cast(self.query_group_index, is_int=True)
+                _cast(self.query_group_index)
                 if self.query_group_index is not None else None
             ),
             cls_marker_indices=(
-                _cast(self.cls_marker_indices, is_int=True)
+                _cast(self.cls_marker_indices)
                 if self.cls_marker_indices is not None else None
             ),
             cls_marker_mask=(
-                _cast(self.cls_marker_mask, is_int=True)
+                _cast(self.cls_marker_mask)
                 if self.cls_marker_mask is not None else None
             ),
             cls_group_index=(
-                _cast(self.cls_group_index, is_int=True)
+                _cast(self.cls_group_index)
                 if self.cls_group_index is not None else None
             ),
             query_layouts=self.query_layouts,
@@ -224,28 +230,8 @@ class PreprocessedBatch:
 # Tokenizer
 # =============================================================================
 
-class WhitespaceTokenSplitter:
-    """Fast regex-based tokenizer for text splitting."""
-    __slots__ = ()
-
-    _PATTERN = re.compile(
-        r"""(?:https?://[^\s]+|www\.[^\s]+)
-        |[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}
-        |@[a-z0-9_]+
-        |\w+(?:[-_]\w+)*
-        |\S""",
-        re.VERBOSE | re.IGNORECASE,
-    )
-
-    def __call__(self, text: str, lower: bool = True) -> Iterator[Tuple[str, int, int]]:
-        # Match against the original text (the pattern is already case-insensitive)
-        # so offsets index the caller's string, then lower-case only the token
-        # value. Lower-casing the text first is unsafe because Unicode case
-        # folding can change length (e.g. "İ".lower() -> "i\u0307"), which would
-        # corrupt the recorded start/end offsets.
-        for m in self._PATTERN.finditer(text):
-            token = m.group()
-            yield (token.lower() if lower else token), m.start(), m.end()
+# Word splitters live in ``gliner2.processing.word_splitter`` so long-document
+# chunking can reuse them without importing the torch-backed processor.
 
 
 # =============================================================================
@@ -286,6 +272,12 @@ class SchemaTransformer:
 
     Provides efficient batch preprocessing via collate functions
     for parallel DataLoader preprocessing.
+
+    ``word_splitter`` may be ``None`` (default ``"whitespace"``), a built-in
+    name (``"whitespace"`` or ``"char"``), or a callable yielding
+    ``(token, start, end)`` with exclusive-end offsets into the original text.
+    ``"char"`` is suitable for languages without whitespace-delimited words,
+    such as Chinese.
     """
 
     # Special tokens
@@ -310,14 +302,15 @@ class SchemaTransformer:
             model_name: str = None,
             tokenizer=None,
             sampling_config: SamplingConfig = None,
-            token_pooling: str = "first"
+            token_pooling: str = "first",
+            word_splitter: Optional[WordSplitterSpec] = None,
     ):
         if model_name is None and tokenizer is None:
             raise ValueError("Either model_name or tokenizer must be provided.")
 
         self.token_pooling = token_pooling if token_pooling in ["first", "mean", "max"] else "first"
         self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(model_name)
-        self.word_splitter = WhitespaceTokenSplitter()
+        self.word_splitter = resolve_word_splitter(word_splitter)
         self.sampling_config = sampling_config or SamplingConfig()
         self.is_training = False
 
@@ -358,6 +351,7 @@ class SchemaTransformer:
             architecture: str = "span",
             max_gold_per_query: int = 32,
             on_capacity_exceeded: str = "raise",
+            ignore_missing_entities: bool = False,
     ) -> PreprocessedBatch:
         """
         Collate function for training DataLoader.
@@ -390,6 +384,7 @@ class SchemaTransformer:
             result, architecture, is_training=True,
             max_gold_per_query=max_gold_per_query,
             on_capacity_exceeded=on_capacity_exceeded,
+            ignore_missing_entities=ignore_missing_entities,
         )
 
     def collate_fn_inference(
@@ -402,6 +397,7 @@ class SchemaTransformer:
             build_targets: Optional[bool] = None,
             max_gold_per_query: int = 32,
             on_capacity_exceeded: str = "raise",
+            ignore_missing_entities: bool = False,
     ) -> PreprocessedBatch:
         """
         Collate function for inference DataLoader.
@@ -428,6 +424,7 @@ class SchemaTransformer:
             result, architecture, is_training=False,
             build_targets=build_targets, max_gold_per_query=max_gold_per_query,
             on_capacity_exceeded=on_capacity_exceeded,
+            ignore_missing_entities=ignore_missing_entities,
         )
 
     @staticmethod
@@ -439,6 +436,7 @@ class SchemaTransformer:
             max_gold_per_query: int = 32,
             build_targets: Optional[bool] = None,
             on_capacity_exceeded: str = "raise",
+            ignore_missing_entities: bool = False,
     ) -> PreprocessedBatch:
         if architecture != "boundary" or len(batch) == 0:
             return batch
@@ -462,6 +460,7 @@ class SchemaTransformer:
             record_metadata_list=record_metadata_list if has_records else None,
             build_targets=build_targets,
             on_capacity_exceeded=on_capacity_exceeded,
+            ignore_missing_entities=ignore_missing_entities,
         )
         batch.query_layouts = layouts
         batch.targets = targets
@@ -865,10 +864,16 @@ class SchemaTransformer:
             # still safe because records are matched by name, not position.
             is_record = bool(record_meta.get(parent, {}).get("mode"))
 
-            all_fields = set()
+            # Preserve declaration order. Converting through a set made schema
+            # prompts depend on PYTHONHASHSEED, which could change both query
+            # ordering and decoded values across otherwise identical processes.
+            common = []
+            seen_fields = set()
             for occ in occurrences:
-                all_fields.update(occ.keys())
-            common = list(all_fields)
+                for field_name in occ:
+                    if field_name not in seen_fields:
+                        common.append(field_name)
+                        seen_fields.add(field_name)
 
             if sampling and sampling.shuffle_json_fields:
                 random.shuffle(common)
@@ -979,6 +984,7 @@ class SchemaTransformer:
         if "relations" not in schema:
             return
 
+        relation_descriptions = schema.get("relation_descriptions", {})
         groups = {}
         for item in schema["relations"]:
             if sampling and random.random() < sampling.remove_relations_prob:
@@ -1013,7 +1019,12 @@ class SchemaTransformer:
                     uniq.append(span)
 
             labels.append([len(uniq), uniq])
-            schemas.append(self._transform_schema(parent, field_names, self.R_TOKEN))
+            schemas.append(self._transform_schema(
+                parent,
+                field_names,
+                self.R_TOKEN,
+                prompt=relation_descriptions.get(parent),
+            ))
             types.append("relations")
 
     def _process_classifications(self, schema, schemas, labels, types, sampling):
@@ -1249,6 +1260,20 @@ class SchemaTransformer:
         combined.append(self.SEP_TEXT)
         combined.extend(text_tokens)
 
+        # Route only the structural marker slots in each schema. Prompt text,
+        # label descriptions, and few-shot examples may themselves tokenize to
+        # special-token IDs; treating those as child markers creates more
+        # classification logits than labels.
+        schema_marker_orig_indices = set()
+        offset = 0
+        for struct in schema_tokens_list:
+            if len(struct) > 1:
+                schema_marker_orig_indices.add(offset + 1)  # [P]
+            schema_marker_orig_indices.update(
+                offset + index for index in range(4, len(struct) - 2, 2)
+            )
+            offset += len(struct) + 1  # Schema tokens plus [SEP_STRUCT].
+
         # Build subword list, mappings, and routing indices
         subwords = []
         mappings = []
@@ -1305,8 +1330,7 @@ class SchemaTransformer:
                 text_word_first_positions.append(subword_pos)
             elif seg_type == "schema":
                 # Track special token positions for schema embeddings
-                tid = self.tokenizer.convert_tokens_to_ids(sub_tokens[0]) if sub_tokens else None
-                if tid is not None and tid in self._special_ids:
+                if orig_idx in schema_marker_orig_indices:
                     schema_special_positions[schema_idx].append(subword_pos)
 
         input_ids = self.tokenizer.convert_tokens_to_ids(subwords)
